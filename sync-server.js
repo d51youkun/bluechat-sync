@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8766;
-const SERVER_VERSION = '2026-07-03';
+const SERVER_VERSION = '2026-07-13';
 
 function resolveWritableDataFile() {
   const legacy = path.join(__dirname, 'data.json');
@@ -181,16 +181,48 @@ function createTransferEntry(data, backup, hours) {
   return { token, shortCode, code: 'bluechat-transfer:' + token, expiresAt };
 }
 
+function emptyData() {
+  return {
+    conversations: {},
+    messages: {},
+    userConversations: {},
+    users: {},
+    friendships: {},
+    userFriendships: {},
+    readReceipts: {},
+    transfers: {},
+    shortTransfers: {},
+    adminSessions: {},
+    callSignals: {},
+    feedback: [],
+    cloudBackups: {},
+    presence: {},
+    announcements: [],
+    announcementReads: {},
+    activityVersion: 0,
+    titlePresets: []
+  };
+}
+
+function normalizeData(data) {
+  const base = emptyData();
+  if (!data || typeof data !== 'object') return { ...base };
+  for (const key of Object.keys(base)) {
+    if (data[key] === undefined) data[key] = base[key];
+  }
+  return data;
+}
+
 function loadData() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    return normalizeData(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
   } catch (e) {
-    return { conversations: {}, messages: {}, userConversations: {}, users: {}, friendships: {}, userFriendships: {}, readReceipts: {}, transfers: {}, shortTransfers: {}, adminSessions: {}, callSignals: {}, feedback: [], cloudBackups: {}, presence: {}, announcements: [], announcementReads: {}, activityVersion: 0, titlePresets: [] };
+    return emptyData();
   }
 }
 
 function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data));
+  fs.writeFileSync(DATA_FILE, JSON.stringify(normalizeData(data)));
 }
 
 function saveDataWithActivity(data) {
@@ -357,8 +389,9 @@ const server = http.createServer(async (req, res) => {
       data.conversations[convId] = { ...conv, id: convId };
       if (!data.userConversations) data.userConversations = {};
       (conv.members || []).forEach(memberId => {
-        if (!data.userConversations[memberId]) data.userConversations[memberId] = {};
-        data.userConversations[memberId][convId] = true;
+        const mid = String(memberId);
+        if (!data.userConversations[mid]) data.userConversations[mid] = {};
+        data.userConversations[mid][convId] = true;
       });
       if (isNewConv) saveDataWithActivity(data);
       else saveData(data);
@@ -386,6 +419,7 @@ const server = http.createServer(async (req, res) => {
       const convId = parts[2];
       const msgId = parts[3];
       const msg = await readBody(req);
+      if (!data.messages) data.messages = {};
       if (!data.messages[convId]) data.messages[convId] = {};
       const isNew = !data.messages[convId][msgId];
       data.messages[convId][msgId] = { ...msg, id: msgId };
@@ -420,7 +454,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'user' && parts[2] && parts[3] === 'conversations') {
-      const userId = parts[2];
+      const userId = String(parts[2]);
       const userConvs = (data.userConversations && data.userConversations[userId]) || {};
       sendJson(res, 200, Object.keys(userConvs));
       return;
