@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8766;
+const SERVER_VERSION = '2026-07-03';
 
 function resolveWritableDataFile() {
   const legacy = path.join(__dirname, 'data.json');
@@ -256,7 +257,7 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         writable = false;
       }
-      sendJson(res, 200, { ok: writable, service: 'BlueChat Sync', writable, dataFile: DATA_FILE });
+      sendJson(res, 200, { ok: writable, service: 'BlueChat Sync', version: SERVER_VERSION, writable, dataFile: DATA_FILE });
       return;
     }
 
