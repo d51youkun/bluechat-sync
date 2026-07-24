@@ -31,9 +31,9 @@ node scripts/migrate_sync_to_upstash.js
 | Production branch | `main` |
 | Root directory | **空欄** |
 | Build command | **空欄** |
-| **Deploy command** | **`npm run cf:deploy`** |
+| **Deploy command** | **`npx wrangler@3.114.14 deploy`** |
 
-Node 22 の設定は **不要**（Wrangler 3.x は Node 20 で動作）。  
+⚠️ **Retry deployment ではなく**、最新コミットから新しいビルドを開始してください（下記参照）。  
 どうしても Node バージョンを変えたい場合: **Settings → Build → Build variables and secrets**（ランタイムの Variables & Secrets ではない）
 
 Deploy command だけで `npm ci` + デプロイまで実行します。

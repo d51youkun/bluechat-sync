@@ -1,13 +1,13 @@
 {
   "name": "bluechat-sync",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "BlueChat message sync server",
   "main": "sync-server.js",
   "scripts": {
     "start": "node sync-server.js",
     "build": "echo \"no build step\"",
     "deploy": "wrangler deploy",
-    "cf:deploy": "wrangler deploy"
+    "cf:deploy": "npx wrangler@3.114.14 deploy"
   },
   "devDependencies": {
     "wrangler": "3.114.14"
