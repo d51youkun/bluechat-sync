@@ -30,11 +30,11 @@ node scripts/migrate_sync_to_upstash.js
 |------|-----|
 | Production branch | `main` |
 | Root directory | **空欄** |
-| Build command | **空欄**（Cloudflare が自動で `npm ci` する） |
+| Build command | **空欄** |
 | **Deploy command** | **`npm run cf:deploy`** |
 
-Node.js **22 以上** が必要（`.nvmrc` に `22` を指定済み）。  
-Cloudflare が Node 20 のままなら **Settings → Build → Environment variables** に `NODE_VERSION` = `22` を追加。
+Node 22 の設定は **不要**（Wrangler 3.x は Node 20 で動作）。  
+どうしても Node バージョンを変えたい場合: **Settings → Build → Build variables and secrets**（ランタイムの Variables & Secrets ではない）
 
 Deploy command だけで `npm ci` + デプロイまで実行します。
 
