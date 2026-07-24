@@ -1,0 +1,15 @@
+# BlueChat 同期サーバー — Cloudflare Workers + Upstash Redis
+name = "bluechat-sync"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[observability]
+enabled = true
+
+# Secrets（wrangler secret put で設定）:
+# UPSTASH_REDIS_REST_URL
+# UPSTASH_REDIS_REST_TOKEN
+# ADMIN_EMAIL
+# ADMIN_PASSWORD

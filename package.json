@@ -4,7 +4,11 @@
   "description": "BlueChat message sync server",
   "main": "sync-server.js",
   "scripts": {
-    "start": "node sync-server.js"
+    "start": "node sync-server.js",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
   },
   "engines": {
     "node": ">=18"
