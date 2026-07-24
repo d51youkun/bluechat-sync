@@ -30,8 +30,11 @@ node scripts/migrate_sync_to_upstash.js
 |------|-----|
 | Production branch | `main` |
 | Root directory | **空欄** |
-| Build command | **空欄**（または `npm ci`） |
+| Build command | **空欄**（Cloudflare が自動で `npm ci` する） |
 | **Deploy command** | **`npm run cf:deploy`** |
+
+Node.js **22 以上** が必要（`.nvmrc` に `22` を指定済み）。  
+Cloudflare が Node 20 のままなら **Settings → Build → Environment variables** に `NODE_VERSION` = `22` を追加。
 
 Deploy command だけで `npm ci` + デプロイまで実行します。
 
