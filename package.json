@@ -5,7 +5,9 @@
   "main": "sync-server.js",
   "scripts": {
     "start": "node sync-server.js",
-    "deploy": "wrangler deploy"
+    "build": "echo \"no build step\"",
+    "deploy": "wrangler deploy",
+    "cf:deploy": "npm ci && wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

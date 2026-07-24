@@ -11,7 +11,7 @@ Belmo の `/tmp` 保存は再起動で消えます。
    - `UPSTASH_REDIS_REST_URL`
    - `UPSTASH_REDIS_REST_TOKEN`
 
-無料枠: 毎日 1 万コマンド・256MB（BlueChat 規模なら十分）
+無料枠: **50万コマンド/月**・256MB（BlueChat 規模なら十分）
 
 ## 2. データ移行（今の Belmo → Upstash）
 
@@ -19,12 +19,38 @@ Belmo の `/tmp` 保存は再起動で消えます。
 cd bluechat-sync
 UPSTASH_REDIS_REST_URL="https://xxxx.upstash.io" \
 UPSTASH_REDIS_REST_TOKEN="AXxxxx" \
-node ../scripts/migrate_sync_to_upstash.js
+node scripts/migrate_sync_to_upstash.js
 ```
 
 ## 3. Cloudflare Worker デプロイ
 
-### 方法A: GitHub Actions（推奨）
+### ビルド設定（Cloudflare Dashboard → Settings → Build）
+
+| 項目 | 値 |
+|------|-----|
+| Production branch | `main` |
+| Root directory | **空欄** |
+| Build command | **空欄**（または `npm ci`） |
+| **Deploy command** | **`npm run cf:deploy`** |
+
+Deploy command だけで `npm ci` + デプロイまで実行します。
+
+**Worker 名は必ず `bluechat-sync`**（`wrangler.toml` の `name` と一致）。  
+ダッシュボードの名前が違うと `The name in your Wrangler configuration file must match` で失敗します。
+
+### デプロイ失敗時
+
+1. **Deployments** → 失敗したビルド → **View build log** を開く
+2. ログ末尾の `✘ [ERROR]` 行を確認
+
+| ログのエラー | 直し方 |
+|-------------|--------|
+| `name ... must match` | Worker 名を **`bluechat-sync`** に変更（Settings → General） |
+| `Missing entry-point` | Root directory が空か確認。`wrangler.toml` があるリポジトリ直下を指す |
+| `Missing CLOUDFLARE_API_TOKEN` | GitHub Actions 用。Cloudflare Builds なら Build token を Settings → Builds で再選択 |
+| `npm ci` failed | Deploy command を `npm install && npx wrangler deploy` に変更 |
+
+### 方法A: Cloudflare Git 連携（推奨）
 
 1. GitHub リポジトリ `bluechat-sync` の **Secrets** に追加（アプリと同じ値でOK）:
    - `CLOUDFLARE_API_TOKEN`
