@@ -87,12 +87,20 @@ function isWorkerRuntime() {
   return r.IS_WORKER === '1' || r.IS_WORKER === 1 || r.IS_WORKER === true;
 }
 
+function cleanEnvValue(value) {
+  let v = String(value || '').trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  return v;
+}
+
 function getUpstashUrl() {
-  return String(getRuntimeEnv().UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+  return cleanEnvValue(getRuntimeEnv().UPSTASH_REDIS_REST_URL).replace(/\/$/, '');
 }
 
 function getUpstashToken() {
-  return String(getRuntimeEnv().UPSTASH_REDIS_REST_TOKEN || '');
+  return cleanEnvValue(getRuntimeEnv().UPSTASH_REDIS_REST_TOKEN);
 }
 
 function isUpstashEnabled() {
@@ -396,10 +404,18 @@ async function upstashCommand(command) {
     },
     body: JSON.stringify(command)
   });
-  if (!res.ok) throw new Error('Upstash HTTP ' + res.status);
-  const json = await res.json();
-  if (json.error) throw new Error('Upstash error: ' + json.error);
-  return json.result;
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch (e) {
+    throw new Error('Upstash HTTP ' + res.status + ' invalid JSON');
+  }
+  if (!res.ok) {
+    throw new Error('Upstash HTTP ' + res.status + (json && json.error ? ': ' + json.error : ''));
+  }
+  if (json && json.error) throw new Error('Upstash error: ' + json.error);
+  return json ? json.result : null;
 }
 
 async function loadDataFromStorage() {
@@ -546,7 +562,12 @@ async function processSyncRequest(req, res) {
         version: SERVER_VERSION,
         writable,
         storage: isUpstashEnabled() ? 'upstash' : (isWorkerRuntime() ? 'worker-required-upstash' : 'file'),
-        dataFile: isUpstashEnabled() ? null : (isWorkerRuntime() ? null : getDataFile())
+        dataFile: isUpstashEnabled() ? null : (isWorkerRuntime() ? null : getDataFile()),
+        upstashHost: (() => {
+          try { return new URL(getUpstashUrl()).hostname; } catch (e) { return null; }
+        })(),
+        tokenLength: getUpstashToken().length,
+        ...(upstashError ? { upstashError } : {})
       });
       return;
     }
