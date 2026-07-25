@@ -9,7 +9,17 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8766;
-const SERVER_VERSION = '2026-07-25-chunk';
+const SERVER_VERSION = '2026-07-25-secure';
+const {
+  MAX_BODY_BYTES,
+  corsHeaders,
+  generateApiToken,
+  sanitizeUser,
+  resolveRequestAuth,
+  isConvMember,
+  isFriendshipParticipant,
+  checkApiAccess
+} = require('./security-auth.js');
 const MEDIA_CHUNK_PREFIX = 'bluechat:chunk:';
 const MEDIA_BLOB_PREFIX = 'bluechat:blob:';
 const MAX_MEDIA_CHUNK_BYTES = 512 * 1024;
@@ -317,11 +327,11 @@ function buildUserSyncBundle(data, userId) {
 
 function assignDevicePairShortCode(data, token, expiresAt) {
   if (!data.shortDevicePairs) data.shortDevicePairs = {};
-  const digits = '0123456789';
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   for (let attempt = 0; attempt < 40; attempt++) {
     let code = '';
-    for (let i = 0; i < 6; i++) {
-      code += digits[Math.floor(Math.random() * digits.length)];
+    for (let i = 0; i < 12; i++) {
+      code += chars[Math.floor(Math.random() * chars.length)];
     }
     const prev = data.shortDevicePairs[code];
     if (!prev || Date.now() > (prev.expiresAt || 0)) {
@@ -329,7 +339,7 @@ function assignDevicePairShortCode(data, token, expiresAt) {
       return code;
     }
   }
-  return String(100000 + Math.floor(Math.random() * 900000));
+  return crypto.randomBytes(8).toString('hex').toUpperCase();
 }
 
 function getDevicePairShortRef(data, shortCode) {
@@ -351,8 +361,8 @@ function createTransferEntry(data, backup, hours) {
     createdAt: Date.now()
   };
   let shortCode = '';
-  for (let i = 0; i < 8; i++) {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let i = 0; i < 12; i++) {
     shortCode += chars[Math.floor(Math.random() * chars.length)];
   }
   data.shortTransfers[shortCode] = { token, expiresAt };
@@ -623,6 +633,10 @@ async function saveDataWithActivity(data) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     if (req._body !== undefined) {
+      if (String(req._body || '').length > MAX_BODY_BYTES) {
+        reject(new Error('body too large'));
+        return;
+      }
       try {
         resolve(req._body ? JSON.parse(req._body) : {});
       } catch (e) {
@@ -631,7 +645,13 @@ function readBody(req) {
       return;
     }
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > MAX_BODY_BYTES) {
+        reject(new Error('body too large'));
+        req.destroy();
+      }
+    });
     req.on('end', () => {
       try {
         resolve(body ? JSON.parse(body) : {});
@@ -644,11 +664,14 @@ function readBody(req) {
 }
 
 function sendJson(res, status, data) {
+  const cors = res._corsHeaders || {
+    'Access-Control-Allow-Origin': 'https://bluechat.by-youhei.workers.dev',
+    'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token, X-User-Id'
+  };
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Token'
+    ...cors
   });
   res.end(JSON.stringify(data));
 }
@@ -656,12 +679,9 @@ function sendJson(res, status, data) {
 const server = IS_WORKER_BUNDLE ? null : http.createServer(processSyncRequest);
 
 async function processSyncRequest(req, res) {
+  res._corsHeaders = corsHeaders(req);
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Token'
-    });
+    res.writeHead(204, res._corsHeaders);
     res.end();
     return;
   }
@@ -707,11 +727,6 @@ async function processSyncRequest(req, res) {
         version: SERVER_VERSION,
         writable,
         storage: isUpstashEnabled() ? 'upstash' : (isWorkerRuntime() ? 'worker-required-upstash' : 'file'),
-        dataFile: isUpstashEnabled() ? null : (isWorkerRuntime() ? null : getDataFile()),
-        upstashHost: (() => {
-          try { return new URL(getUpstashUrl()).hostname; } catch (e) { return null; }
-        })(),
-        tokenLength: getUpstashToken().length,
         ...(upstashError ? { upstashError } : {})
       });
       return;
@@ -731,12 +746,40 @@ async function processSyncRequest(req, res) {
       return;
     }
 
+    const data = await loadData();
+    const auth = resolveRequestAuth(req, data, verifyAdminSession);
+
+    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'auth' && parts[2] === 'claim-token') {
+      const body = await readBody(req);
+      const userId = String(body.userId || '').trim();
+      if (!userId || !data.users || !data.users[userId]) {
+        sendJson(res, 404, { error: 'not_found' });
+        return;
+      }
+      const user = data.users[userId];
+      const proof = String(body.passwordHash || '');
+      if (user.apiToken) {
+        if (user.passwordHash && user.passwordHash !== proof) {
+          sendJson(res, 403, { error: 'invalid_proof' });
+          return;
+        }
+      } else if (user.passwordHash && user.passwordHash !== proof) {
+        sendJson(res, 403, { error: 'invalid_proof' });
+        return;
+      }
+      if (!user.apiToken) user.apiToken = generateApiToken();
+      await saveData(data);
+      sendJson(res, 200, { ok: true, apiToken: user.apiToken });
+      return;
+    }
+
+    const access = checkApiAccess(req, res, data, parts, url, auth, res._corsHeaders);
+    if (access === 'handled') return;
+
     if (await handleMediaChunkRoutes(req, res, parts)) return;
 
-    const data = await loadData();
-
     const adminToken = req.headers['x-admin-token'] || req.headers['X-Admin-Token'] || '';
-    const adminRoleFromToken = verifyAdminSession(data, adminToken, false);
+    const adminRoleFromToken = auth.kind === 'admin' ? auth.role : null;
 
     if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'force-sync') {
       let role = adminRoleFromToken;
@@ -823,7 +866,7 @@ async function processSyncRequest(req, res) {
         sendJson(res, 404, { error: 'expired' });
         return;
       }
-      sendJson(res, 200, { code: 'bluechat-transfer:' + ref.token, backup: t.backup });
+      sendJson(res, 200, { code: 'bluechat-transfer:' + ref.token });
       return;
     }
 
@@ -864,6 +907,10 @@ async function processSyncRequest(req, res) {
       const convId = parts[2];
       const msgId = parts[3];
       const msg = await readBody(req);
+      if (auth.kind === 'user' && String(msg.senderId || '') !== String(auth.userId)) {
+        sendJson(res, 403, { error: 'sender_mismatch' });
+        return;
+      }
       if (!data.messages) data.messages = {};
       if (!data.messages[convId]) data.messages[convId] = {};
       const isNew = !data.messages[convId][msgId];
@@ -919,21 +966,44 @@ async function processSyncRequest(req, res) {
     if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'users' && parts[2]) {
       const user = await readBody(req);
       if (!data.users) data.users = {};
-      const prev = data.users[parts[2]] || {};
-      data.users[parts[2]] = { ...user, id: parts[2] };
-      const moderationChanged = prev.banned !== user.banned
-        || prev.bannedUntil !== user.bannedUntil
-        || prev.suspendedUntil !== user.suspendedUntil
-        || prev.premium !== user.premium
-        || prev.superPremium !== user.superPremium
-        || JSON.stringify(prev.title) !== JSON.stringify(user.title);
-      const profileChanged = prev.avatar !== user.avatar
-        || (prev.avatarUpdatedAt || 0) !== (user.avatarUpdatedAt || 0)
-        || prev.name !== user.name
-        || prev.passwordHash !== user.passwordHash;
-      if (moderationChanged || profileChanged) await saveDataWithActivity(data);
+      const uid = String(parts[2]);
+      const prev = data.users[uid] || {};
+      const isNew = !prev.id;
+      const isAdmin = auth.kind === 'admin';
+      let apiToken = prev.apiToken || null;
+      if (!apiToken) apiToken = generateApiToken();
+      const next = {
+        ...prev,
+        ...user,
+        id: uid,
+        apiToken
+      };
+      if (!isAdmin) {
+        next.banned = prev.banned;
+        next.bannedUntil = prev.bannedUntil;
+        next.suspendedUntil = prev.suspendedUntil;
+        next.premium = prev.premium;
+        next.superPremium = prev.superPremium;
+        next.title = prev.title;
+      }
+      delete next.apiToken;
+      next.apiToken = apiToken;
+      data.users[uid] = next;
+      const moderationChanged = isAdmin && (
+        prev.banned !== next.banned
+        || prev.bannedUntil !== next.bannedUntil
+        || prev.suspendedUntil !== next.suspendedUntil
+        || prev.premium !== next.premium
+        || prev.superPremium !== next.superPremium
+        || JSON.stringify(prev.title) !== JSON.stringify(next.title)
+      );
+      const profileChanged = prev.avatar !== next.avatar
+        || (prev.avatarUpdatedAt || 0) !== (next.avatarUpdatedAt || 0)
+        || prev.name !== next.name
+        || prev.passwordHash !== next.passwordHash;
+      if (moderationChanged || profileChanged || isNew) await saveDataWithActivity(data);
       else await saveData(data);
-      sendJson(res, 200, { ok: true });
+      sendJson(res, 200, { ok: true, apiToken: isNew || !prev.apiToken ? apiToken : undefined });
       return;
     }
 
@@ -957,7 +1027,7 @@ async function processSyncRequest(req, res) {
     }
 
     if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'users' && parts[2]) {
-      const user = (data.users && data.users[parts[2]]) || null;
+      const user = sanitizeUser((data.users && data.users[parts[2]]) || null);
       sendJson(res, 200, user);
       return;
     }
@@ -1006,6 +1076,10 @@ async function processSyncRequest(req, res) {
 
     if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'friendships' && parts[2]) {
       const body = await readBody(req);
+      if (auth.kind === 'user' && !isFriendshipParticipant(body, auth.userId)) {
+        sendJson(res, 403, { error: 'not_participant' });
+        return;
+      }
       const id1 = String(body.user1 || '');
       const id2 = String(body.user2 || '');
       if (!id1 || !id2 || id1 === id2) {

@@ -2,12 +2,7 @@
  * Cloudflare Workers エントリ — BlueChat 同期サーバー
  */
 const { processSyncRequest, configureRuntime } = require('./sync-server.js');
-
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Token'
-};
+const { corsHeaders } = require('./security-auth.js');
 
 function toNodeRequest(request, bodyText) {
   const url = new URL(request.url);
@@ -25,17 +20,18 @@ function toNodeRequest(request, bodyText) {
 
 function runProcessSyncRequest(req) {
   return new Promise((resolve, reject) => {
+    const cors = corsHeaders(req);
     const res = {
       statusCode: 200,
-      _headers: { ...CORS },
+      _corsHeaders: cors,
       writeHead(status, headers) {
         this.statusCode = status;
-        this._headers = { ...CORS, ...(headers || {}) };
+        this._corsHeaders = { ...cors, ...(headers || {}) };
       },
       end(payload) {
         resolve(new Response(payload || '', {
           status: this.statusCode,
-          headers: this._headers
+          headers: this._corsHeaders
         }));
       }
     };
@@ -51,7 +47,8 @@ export default {
     });
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: CORS });
+      const req = toNodeRequest(request, '');
+      return new Response(null, { status: 204, headers: corsHeaders(req) });
     }
 
     const bodyText = request.method === 'GET' || request.method === 'HEAD'
