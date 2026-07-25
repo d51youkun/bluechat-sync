@@ -184,6 +184,39 @@ function stubUserRecord(uid, name) {
   };
 }
 
+function isPlaceholderUserName(name) {
+  const n = String(name || '').trim();
+  return !n || ['友だち', '友達', '友達さん', 'ユーザー', '不明'].includes(n);
+}
+
+function pickBetterUserName(localName, incomingName) {
+  const local = String(localName || '').trim();
+  const incoming = String(incomingName || '').trim();
+  if (!incoming) return local || 'ユーザー';
+  if (!local) return incoming;
+  const localPh = isPlaceholderUserName(local);
+  const incomingPh = isPlaceholderUserName(incoming);
+  if (localPh && !incomingPh) return incoming;
+  if (!localPh && incomingPh) return local;
+  return incoming.length >= local.length ? incoming : local;
+}
+
+function mergeUserProfile(data, profile) {
+  if (!profile || !profile.id) return;
+  if (!data.users) data.users = {};
+  const uid = String(profile.id);
+  const existing = data.users[uid] || stubUserRecord(uid, profile.name);
+  const name = pickBetterUserName(existing.name, profile.name);
+  data.users[uid] = {
+    ...existing,
+    ...profile,
+    id: uid,
+    name,
+    avatar: profile.avatar !== undefined ? profile.avatar : existing.avatar,
+    avatarUpdatedAt: profile.avatarUpdatedAt || existing.avatarUpdatedAt || 0
+  };
+}
+
 function inferUserName(data, uid) {
   for (const post of data.posts || []) {
     if (String(post.authorId) === uid && post.authorName) return String(post.authorName);
@@ -984,6 +1017,11 @@ async function processSyncRequest(req, res) {
       if (!data.conversations) data.conversations = {};
       if (!data.userConversations) data.userConversations = {};
       data.friendships[parts[2]] = { user1: id1, user2: id2, createdAt: body.createdAt || Date.now() };
+      if (body.users && typeof body.users === 'object') {
+        Object.values(body.users).forEach(u => mergeUserProfile(data, u));
+      } else {
+        [id1, id2].forEach(uid => ensureUserRecord(data, uid));
+      }
       [id1, id2].forEach(uid => {
         if (!data.userFriendships[uid]) data.userFriendships[uid] = {};
         data.userFriendships[uid][uid === id1 ? id2 : id1] = true;
