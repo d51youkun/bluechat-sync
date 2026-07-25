@@ -521,11 +521,13 @@ async function processSyncRequest(req, res) {
 
     if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'health') {
       let writable = true;
+      let upstashError = null;
       if (isUpstashEnabled()) {
         try {
           await upstashCommand(['SET', 'bluechat:health-probe', String(Date.now())]);
         } catch (e) {
           writable = false;
+          upstashError = String(e.message || e);
         }
       } else if (!isWorkerRuntime()) {
         try {
