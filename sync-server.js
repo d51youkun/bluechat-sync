@@ -9,7 +9,10 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8766;
-const SERVER_VERSION = '2026-07-13';
+const SERVER_VERSION = '2026-07-25-chunk';
+const MEDIA_CHUNK_PREFIX = 'bluechat:chunk:';
+const MEDIA_BLOB_PREFIX = 'bluechat:blob:';
+const MAX_MEDIA_CHUNK_BYTES = 512 * 1024;
 
 // Cloudflare Workers バンドルは ESM のため __dirname が無い。Node 単体起動時のみファイル I/O を初期化。
 const IS_WORKER_BUNDLE = typeof __dirname === 'undefined';
@@ -418,6 +421,115 @@ async function upstashCommand(command) {
   return json ? json.result : null;
 }
 
+function mediaChunkKey(uploadId, partIndex) {
+  return MEDIA_CHUNK_PREFIX + uploadId + ':' + partIndex;
+}
+
+function mediaBlobKey(uploadId) {
+  return MEDIA_BLOB_PREFIX + uploadId;
+}
+
+const MEDIA_STRIP_FIELDS = ['image', 'video', 'fileData', 'stickerImage'];
+
+function stripMessageForLite(msg) {
+  if (!msg || typeof msg !== 'object') return msg;
+  const out = { ...msg };
+  for (const field of MEDIA_STRIP_FIELDS) {
+    const payload = out[field];
+    if (typeof payload === 'string' && payload.length > 50000) {
+      if (!out.blobRef || out.blobRef.field !== field) out._needsFull = true;
+      delete out[field];
+    } else if (out.blobRef && out.blobRef.field === field) {
+      delete out[field];
+    }
+  }
+  if (out.blobRef && out.blobRef.field === 'text' && typeof out.text === 'string' && out.text.length > 120) {
+    out.text = out.text.slice(0, 80) + '…';
+  }
+  if (typeof out.text === 'string' && out.text.length > 100000) {
+    out.text = out.text.slice(0, 120) + '…';
+    out._needsFull = true;
+  }
+  return out;
+}
+
+async function handleMediaChunkRoutes(req, res, parts) {
+  if (!isUpstashEnabled()) {
+    sendJson(res, 501, { error: 'chunk upload requires upstash' });
+    return true;
+  }
+
+  if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'chunk' && parts[3] && parts[4] !== undefined && parts[4] !== 'complete') {
+    const uploadId = parts[3];
+    const partIndex = parseInt(parts[4], 10);
+    if (!uploadId || Number.isNaN(partIndex) || partIndex < 0) {
+      sendJson(res, 400, { error: 'invalid chunk path' });
+      return true;
+    }
+    const body = await readBody(req);
+    if (!body || typeof body.data !== 'string') {
+      sendJson(res, 400, { error: 'invalid chunk body' });
+      return true;
+    }
+    if (body.data.length > MAX_MEDIA_CHUNK_BYTES) {
+      sendJson(res, 413, { error: 'chunk too large' });
+      return true;
+    }
+    await upstashCommand(['SET', mediaChunkKey(uploadId, partIndex), body.data]);
+    sendJson(res, 200, { ok: true, partIndex, totalParts: body.totalParts || 0 });
+    return true;
+  }
+
+  if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'chunk' && parts[3] && parts[4] === 'complete') {
+    const uploadId = parts[3];
+    const body = await readBody(req);
+    const totalParts = parseInt(body.totalParts || 0, 10);
+    if (!uploadId || !totalParts || totalParts > 500) {
+      sendJson(res, 400, { error: 'invalid totalParts' });
+      return true;
+    }
+    const chunks = [];
+    for (let i = 0; i < totalParts; i++) {
+      const part = await upstashCommand(['GET', mediaChunkKey(uploadId, i)]);
+      if (typeof part !== 'string') {
+        sendJson(res, 400, { error: 'missing part ' + i });
+        return true;
+      }
+      chunks.push(part);
+    }
+    const data = chunks.join('');
+    const blobPayload = JSON.stringify({
+      data,
+      mimeType: body.mimeType || 'application/octet-stream',
+      field: body.field || 'image',
+      size: data.length,
+      createdAt: Date.now()
+    });
+    await upstashCommand(['SET', mediaBlobKey(uploadId), blobPayload]);
+    for (let i = 0; i < totalParts; i++) {
+      upstashCommand(['DEL', mediaChunkKey(uploadId, i)]).catch(() => {});
+    }
+    sendJson(res, 200, { ok: true, uploadId, size: data.length });
+    return true;
+  }
+
+  if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'blob' && parts[3]) {
+    const raw = await upstashCommand(['GET', mediaBlobKey(parts[3])]);
+    if (!raw) {
+      sendJson(res, 404, { error: 'not found' });
+      return true;
+    }
+    try {
+      sendJson(res, 200, JSON.parse(raw));
+    } catch (e) {
+      sendJson(res, 500, { error: 'invalid blob' });
+    }
+    return true;
+  }
+
+  return false;
+}
+
 async function loadDataFromStorage() {
   if (isUpstashEnabled()) {
     try {
@@ -586,6 +698,8 @@ async function processSyncRequest(req, res) {
       return;
     }
 
+    if (await handleMediaChunkRoutes(req, res, parts)) return;
+
     const data = await loadData();
 
     const adminToken = req.headers['x-admin-token'] || req.headers['X-Admin-Token'] || '';
@@ -727,13 +841,24 @@ async function processSyncRequest(req, res) {
       return;
     }
 
+    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'messages' && parts[2] && parts[3] && parts[3] !== 'ids') {
+      const convId = parts[2];
+      const msgId = parts[3];
+      const msg = (data.messages[convId] || {})[msgId] || null;
+      if (!msg) sendJson(res, 404, { error: 'not found' });
+      else sendJson(res, 200, msg);
+      return;
+    }
+
     if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'messages' && parts[2]) {
       const convId = parts[2];
       const since = parseInt(url.searchParams.get('since') || '0', 10);
+      const lite = url.searchParams.get('lite') === '1';
       const convMsgs = data.messages[convId] || {};
-      const list = Object.values(convMsgs)
+      let list = Object.values(convMsgs)
         .filter(m => (m.timestamp || 0) > since)
         .sort((a, b) => a.timestamp - b.timestamp);
+      if (lite) list = list.map(stripMessageForLite);
       sendJson(res, 200, list);
       return;
     }
