@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8766;
-const SERVER_VERSION = '2026-07-25-secure';
+const SERVER_VERSION = '2026-08-09-cache';
 const {
   MAX_BODY_BYTES,
   corsHeaders,
@@ -88,7 +88,9 @@ let runtimeEnv = null;
 
 function configureRuntime(env) {
   runtimeEnv = env || null;
-  memData = null;
+  // キャッシュ(memData/memVer)はここでは破棄しない。
+  // worker.js がリクエスト毎に configureRuntime を呼ぶため、ここで消すと
+  // isolate 内キャッシュが一切効かなくなる。env の実体が変わることはない。
 }
 
 function getRuntimeEnv() {
@@ -121,6 +123,10 @@ function isUpstashEnabled() {
 }
 
 const UPSTASH_KEY = 'bluechat:data';
+// 軽量バージョンキー。Worker isolate 内キャッシュの鮮度判定に使う。
+// 毎リクエスト巨大な bluechat:data を GET→JSON.parse すると遅延・CPU超過の原因になるため、
+// キャッシュ有効時はこの小さなキーの GET だけで済ませる。
+const UPSTASH_VER_KEY = 'bluechat:ver';
 
 const ADMIN_EMAIL = () => String(getRuntimeEnv().ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = () => String(getRuntimeEnv().ADMIN_PASSWORD || '');
@@ -497,6 +503,8 @@ function stripMessageForLite(msg) {
 }
 
 async function handleMediaChunkRoutes(req, res, parts) {
+  const isMediaRoute = parts[0] === 'api' && parts[1] === 'media';
+  if (!isMediaRoute) return false;
   if (!isUpstashEnabled()) {
     sendJson(res, 501, { error: 'chunk upload requires upstash' });
     return true;
@@ -575,13 +583,10 @@ async function handleMediaChunkRoutes(req, res, parts) {
 
 async function loadDataFromStorage() {
   if (isUpstashEnabled()) {
-    try {
-      const raw = await upstashCommand(['GET', UPSTASH_KEY]);
-      return normalizeData(raw ? JSON.parse(raw) : emptyData());
-    } catch (e) {
-      console.error('Upstash loadData failed, falling back to empty data:', e.message);
-      return emptyData();
-    }
+    // 読み込み失敗時に emptyData() へフォールバックすると、後続の saveData が
+    // 正常データを空で上書きしてしまう。必ず throw して 500 にし、データを守る。
+    const raw = await upstashCommand(['GET', UPSTASH_KEY]);
+    return normalizeData(raw ? JSON.parse(raw) : emptyData());
   }
   try {
     return normalizeData(JSON.parse(fs.readFileSync(getDataFile(), 'utf8')));
@@ -591,6 +596,7 @@ async function loadDataFromStorage() {
 }
 
 let memData = null;
+let memVer = null; // isolate 内キャッシュが対応する UPSTASH_VER_KEY の値
 let dataLock = Promise.resolve();
 
 function withDataLock(fn) {
@@ -601,10 +607,37 @@ function withDataLock(fn) {
 
 async function loadData() {
   return withDataLock(async () => {
-    if (!isWorkerRuntime() && memData) {
+    if (memData && !isWorkerRuntime()) {
       return JSON.parse(JSON.stringify(memData));
     }
+    if (memData && isWorkerRuntime() && isUpstashEnabled()) {
+      // キャッシュあり: 軽量バージョンキーだけ確認し、不変ならフル取得をスキップ
+      try {
+        const ver = await upstashCommand(['GET', UPSTASH_VER_KEY]);
+        if (ver !== null && memVer !== null && String(ver) === String(memVer)) {
+          return JSON.parse(JSON.stringify(memData));
+        }
+      } catch (e) {
+        // バージョン確認に失敗しても古いキャッシュで処理を継続する
+        // (書き込みは saveData 側の失敗で止まるため空データ化の危険はない)
+        console.error('Upstash version check failed, serving cached data:', e.message);
+        return JSON.parse(JSON.stringify(memData));
+      }
+    }
     memData = await loadDataFromStorage();
+    if (isWorkerRuntime() && isUpstashEnabled()) {
+      try {
+        let ver = await upstashCommand(['GET', UPSTASH_VER_KEY]);
+        if (ver === null) {
+          // 初回: マーカーを設置して以降のキャッシュを有効化
+          ver = 'init-' + Date.now() + '-' + crypto.randomBytes(6).toString('hex');
+          await upstashCommand(['SET', UPSTASH_VER_KEY, ver]);
+        }
+        memVer = String(ver);
+      } catch (e) {
+        memVer = null;
+      }
+    }
     return JSON.parse(JSON.stringify(memData));
   });
 }
@@ -613,6 +646,10 @@ async function saveDataToStorage(data) {
   const normalized = normalizeData(data);
   if (isUpstashEnabled()) {
     await upstashCommand(['SET', UPSTASH_KEY, JSON.stringify(normalized)]);
+    // データ書込成功後にバージョンを進める
+    const ver = Date.now() + '-' + crypto.randomBytes(6).toString('hex');
+    await upstashCommand(['SET', UPSTASH_VER_KEY, ver]);
+    memVer = ver;
     return;
   }
   fs.writeFileSync(getDataFile(), JSON.stringify(normalized));
@@ -703,6 +740,7 @@ async function processSyncRequest(req, res) {
     if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'health') {
       let writable = true;
       let upstashError = null;
+      let dataBytes = null;
       if (isUpstashEnabled()) {
         try {
           await upstashCommand(['SET', 'bluechat:health-probe', String(Date.now())]);
@@ -710,6 +748,9 @@ async function processSyncRequest(req, res) {
           writable = false;
           upstashError = String(e.message || e);
         }
+        try {
+          dataBytes = await upstashCommand(['STRLEN', UPSTASH_KEY]);
+        } catch (e) { /* 診断用なので失敗しても無視 */ }
       } else if (!isWorkerRuntime()) {
         try {
           const probe = path.join(path.dirname(getDataFile()), '.bluechat-health-probe');
@@ -727,6 +768,7 @@ async function processSyncRequest(req, res) {
         version: SERVER_VERSION,
         writable,
         storage: isUpstashEnabled() ? 'upstash' : (isWorkerRuntime() ? 'worker-required-upstash' : 'file'),
+        ...(dataBytes !== null ? { dataBytes } : {}),
         ...(upstashError ? { upstashError } : {})
       });
       return;
