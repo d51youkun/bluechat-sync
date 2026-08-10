@@ -141,6 +141,39 @@ function verifyAdminLogin(email, password) {
   return null;
 }
 
+// Account restore happens before the browser has an API token.  Keep the
+// password proof in this endpoint and never expose passwordHash to clients.
+function simplePasswordHash(value) {
+  let h = 0;
+  const text = String(value || '');
+  for (let i = 0; i < text.length; i++) h = ((h << 5) - h) + text.charCodeAt(i) | 0;
+  return 'h' + Math.abs(h).toString(36);
+}
+
+function verifyUserPasswordProof(password, stored) {
+  const hash = String(stored || '');
+  if (!hash) return true;
+  const text = String(password || '');
+  if (hash.startsWith('pbkdf2:')) {
+    const parts = hash.split(':');
+    if (parts.length !== 4) return false;
+    const iterations = parseInt(parts[1], 10) || 120000;
+    try {
+      const derived = crypto.pbkdf2Sync(
+        Buffer.from(text, 'utf8'),
+        Buffer.from(parts[2], 'base64'),
+        iterations,
+        32,
+        'sha256'
+      ).toString('base64');
+      return crypto.timingSafeEqual(Buffer.from(derived), Buffer.from(parts[3]));
+    } catch (e) {
+      return false;
+    }
+  }
+  return simplePasswordHash(text) === hash;
+}
+
 function issueAdminSession(data, role) {
   if (!data.adminSessions) data.adminSessions = {};
   const token = crypto.randomBytes(24).toString('hex');
@@ -800,12 +833,11 @@ async function processSyncRequest(req, res) {
       }
       const user = data.users[userId];
       const proof = String(body.passwordHash || '');
-      if (user.apiToken) {
-        if (user.passwordHash && user.passwordHash !== proof) {
-          sendJson(res, 403, { error: 'invalid_proof' });
-          return;
-        }
-      } else if (user.passwordHash && user.passwordHash !== proof) {
+      const password = body.password === undefined ? null : String(body.password || '');
+      const proofOk = user.passwordHash
+        ? (proof && user.passwordHash === proof) || (password !== null && verifyUserPasswordProof(password, user.passwordHash))
+        : true;
+      if (!proofOk) {
         sendJson(res, 403, { error: 'invalid_proof' });
         return;
       }
