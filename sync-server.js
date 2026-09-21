@@ -1,1962 +1,596 @@
 /**
- * BlueChat 同期サーバー
- * 起動: node server/sync-server.js
- * デフォルト: http://0.0.0.0:8766
+ * BlueChat Sync Server v1.0 (clean rewrite)
+ * Cloudflare Workers + KV storage
+ * 
+ * API Endpoints:
+ *   GET  /api/health
+ *   POST /api/auth/claim-token
+ *   POST /api/admin/login
+ *   GET  /api/users/list
+ *   GET  /api/users/:id
+ *   PUT  /api/users/:id
+ *   DELETE /api/users/:id
+ *   GET  /api/messages/:convId
+ *   PUT  /api/messages/:convId/:msgId
+ *   DELETE /api/messages/:convId/:msgId
+ *   GET  /api/conversations/list
+ *   GET  /api/conversations/:convId
+ *   PUT  /api/conversations/:convId
+ *   GET  /api/user/:userId/conversations
+ *   GET  /api/user/:userId/friendships
+ *   PUT  /api/friendships/:userId
+ *   PUT  /api/reads/:convId/:userId
+ *   GET  /api/reads/:convId
+ *   POST /api/call/signal
+ *   GET  /api/call/signals/:userId
+ *   GET  /api/posts
+ *   POST /api/posts
+ *   PUT  /api/posts/:id/vote
+ *   POST /api/posts/:id/comments
+ *   DELETE /api/posts/:id/comments/:cid
+ *   DELETE /api/posts/:id
+ *   GET  /api/announcements
+ *   POST /api/announcements
+ *   DELETE /api/announcements/:id
+ *   GET  /api/presence
+ *   PUT  /api/presence/:userId
+ *   GET  /api/title-presets
+ *   PUT  /api/title-presets
+ *   PUT  /api/media/chunk/:uploadId/:chunkIdx
+ *   POST /api/media/chunk/:uploadId/complete
+ *   GET  /api/media/blob/:uploadId
  */
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
 
-const PORT = process.env.PORT || 8766;
-const SERVER_VERSION = '2026-08-09-cache';
-const {
-  MAX_BODY_BYTES,
-  corsHeaders,
-  generateApiToken,
-  sanitizeUser,
-  resolveRequestAuth,
-  isConvMember,
-  isFriendshipParticipant,
-  checkApiAccess
-} = require('./security-auth.js');
-const MEDIA_CHUNK_PREFIX = 'bluechat:chunk:';
-const MEDIA_BLOB_PREFIX = 'bluechat:blob:';
-const MAX_MEDIA_CHUNK_BYTES = 512 * 1024;
+const VERSION = '2026-09-09-v1-secure';
 
-// Cloudflare Workers バンドルは ESM のため __dirname が無い。Node 単体起動時のみファイル I/O を初期化。
-const IS_WORKER_BUNDLE = typeof __dirname === 'undefined';
-const MODULE_DIR = IS_WORKER_BUNDLE ? '' : __dirname;
+// ─── CORS ──────────────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'https://bluechat.by-youhei.workers.dev',
+  'https://bluechat-sync.by-youhei.workers.dev',
+  'https://bluechat.youheiapp.workers.dev',
+  'https://bluechat-sync.youheiapp.workers.dev',
+];
 
-function resolveWritableDataFile() {
-  const legacy = path.join(MODULE_DIR, 'data.json');
-  const candidates = [
-    process.env.DATA_DIR,
-    process.env.TMPDIR,
-    process.env.TEMP,
-    '/tmp'
-  ].filter(Boolean).map(dir => path.join(dir, 'bluechat-data.json'));
-  candidates.push(legacy);
-  for (const file of candidates) {
-    try {
-      const dir = path.dirname(file);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const probe = path.join(dir, '.bluechat-write-test');
-      fs.writeFileSync(probe, 'ok');
-      fs.unlinkSync(probe);
-      if (file !== legacy && fs.existsSync(legacy) && !fs.existsSync(file)) {
-        try { fs.copyFileSync(legacy, file); } catch (e) { /* ignore */ }
-      }
-      return file;
-    } catch (e) { /* try next */ }
-  }
-  return legacy;
-}
-
-let DATA_FILE = null;
-function getDataFile() {
-  if (IS_WORKER_BUNDLE) return '/tmp/bluechat-data.json';
-  if (!DATA_FILE) DATA_FILE = resolveWritableDataFile();
-  return DATA_FILE;
-}
-
-function loadDotEnv() {
-  if (IS_WORKER_BUNDLE) return;
-  const envPath = path.join(MODULE_DIR, '.env');
-  try {
-    if (!fs.existsSync(envPath)) return;
-    fs.readFileSync(envPath, 'utf8').split('\n').forEach(line => {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) return;
-      const eq = trimmed.indexOf('=');
-      if (eq < 1) return;
-      const key = trimmed.slice(0, eq).trim();
-      if (process.env[key] !== undefined) return;
-      let val = trimmed.slice(eq + 1).trim();
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-        val = val.slice(1, -1);
-      }
-      process.env[key] = val;
-    });
-  } catch (e) { /* ignore */ }
-}
-
-if (!IS_WORKER_BUNDLE) loadDotEnv();
-
-// Upstash Redis (REST API) 経由の永続化。Cloudflare Workers では必須。
-let runtimeEnv = null;
-
-function configureRuntime(env) {
-  runtimeEnv = env || null;
-  // キャッシュ(memData/memVer)はここでは破棄しない。
-  // worker.js がリクエスト毎に configureRuntime を呼ぶため、ここで消すと
-  // isolate 内キャッシュが一切効かなくなる。env の実体が変わることはない。
-}
-
-function getRuntimeEnv() {
-  return runtimeEnv || process.env;
-}
-
-function isWorkerRuntime() {
-  const r = getRuntimeEnv();
-  return r.IS_WORKER === '1' || r.IS_WORKER === 1 || r.IS_WORKER === true;
-}
-
-function cleanEnvValue(value) {
-  let v = String(value || '').trim();
-  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-    v = v.slice(1, -1).trim();
-  }
-  return v;
-}
-
-function getUpstashUrl() {
-  return cleanEnvValue(getRuntimeEnv().UPSTASH_REDIS_REST_URL).replace(/\/$/, '');
-}
-
-function getUpstashToken() {
-  return cleanEnvValue(getRuntimeEnv().UPSTASH_REDIS_REST_TOKEN);
-}
-
-function isUpstashEnabled() {
-  return !!(getUpstashUrl() && getUpstashToken());
-}
-
-const UPSTASH_KEY = 'bluechat:data';
-// 軽量バージョンキー。Worker isolate 内キャッシュの鮮度判定に使う。
-// 毎リクエスト巨大な bluechat:data を GET→JSON.parse すると遅延・CPU超過の原因になるため、
-// キャッシュ有効時はこの小さなキーの GET だけで済ませる。
-const UPSTASH_VER_KEY = 'bluechat:ver';
-
-const ADMIN_EMAIL = () => String(getRuntimeEnv().ADMIN_EMAIL || '').trim().toLowerCase();
-const ADMIN_PASSWORD = () => String(getRuntimeEnv().ADMIN_PASSWORD || '');
-const MODERATOR_EMAIL = () => String(getRuntimeEnv().MODERATOR_EMAIL || '').trim().toLowerCase();
-const MODERATOR_PASSWORD = () => String(getRuntimeEnv().MODERATOR_PASSWORD || '');
-
-function verifyAdminLogin(email, password) {
-  const e = String(email || '').trim().toLowerCase();
-  const p = String(password || '').trim();
-  if (ADMIN_EMAIL() && ADMIN_PASSWORD() && e === ADMIN_EMAIL() && p === ADMIN_PASSWORD()) return 'super';
-  if (MODERATOR_EMAIL() && MODERATOR_PASSWORD() && e === MODERATOR_EMAIL() && p === MODERATOR_PASSWORD()) return 'moderator';
-  return null;
-}
-
-// Account restore happens before the browser has an API token.  Keep the
-// password proof in this endpoint and never expose passwordHash to clients.
-function simplePasswordHash(value) {
-  let h = 0;
-  const text = String(value || '');
-  for (let i = 0; i < text.length; i++) h = ((h << 5) - h) + text.charCodeAt(i) | 0;
-  return 'h' + Math.abs(h).toString(36);
-}
-
-function verifyUserPasswordProof(password, stored) {
-  const hash = String(stored || '');
-  if (!hash) return true;
-  const text = String(password || '');
-  if (hash.startsWith('pbkdf2:')) {
-    const parts = hash.split(':');
-    if (parts.length !== 4) return false;
-    const iterations = parseInt(parts[1], 10) || 120000;
-    try {
-      const derived = crypto.pbkdf2Sync(
-        Buffer.from(text, 'utf8'),
-        Buffer.from(parts[2], 'base64'),
-        iterations,
-        32,
-        'sha256'
-      ).toString('base64');
-      return crypto.timingSafeEqual(Buffer.from(derived), Buffer.from(parts[3]));
-    } catch (e) {
-      return false;
-    }
-  }
-  return simplePasswordHash(text) === hash;
-}
-
-function issueAdminSession(data, role) {
-  if (!data.adminSessions) data.adminSessions = {};
-  const token = crypto.randomBytes(24).toString('hex');
-  data.adminSessions[token] = { role, expiresAt: Date.now() + 86400000 };
-  Object.keys(data.adminSessions).forEach(k => {
-    if (data.adminSessions[k].expiresAt < Date.now()) delete data.adminSessions[k];
-  });
-  return token;
-}
-
-function verifyAdminSession(data, token, needSuper) {
-  if (!token || !data.adminSessions) return null;
-  const s = data.adminSessions[token];
-  if (!s || s.expiresAt < Date.now()) return null;
-  if (needSuper && s.role !== 'super') return null;
-  return s.role;
-}
-
-function friendshipListForUser(data, userId) {
-  const uid = String(userId);
-  const out = [];
-  const seen = new Set();
-  const add = (f) => {
-    if (!f || !f.user1 || !f.user2) return;
-    const key = [String(f.user1), String(f.user2)].sort().join('_');
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push({
-      user1: String(f.user1),
-      user2: String(f.user2),
-      createdAt: f.createdAt || Date.now()
-    });
-  };
-  const raw = data.friendships || {};
-  if (Array.isArray(raw)) raw.forEach(add);
-  else Object.values(raw).forEach(f => {
-    if (String(f.user1) === uid || String(f.user2) === uid) add(f);
-  });
-  const ufs = (data.userFriendships && data.userFriendships[uid]) || {};
-  Object.keys(ufs).forEach(fid => add({ user1: uid, user2: fid, createdAt: Date.now() }));
-  return out;
-}
-
-function stubUserRecord(uid, name) {
+function corsHeaders(origin) {
+  // Allow any workers.dev subdomain, plus listed origins
+  const isAllowed = ALLOWED_ORIGINS.includes(origin) ||
+    (origin && origin.endsWith('.workers.dev'));
+  const allowed = isAllowed ? origin : ALLOWED_ORIGINS[0];
   return {
-    id: uid,
-    name: name || 'ユーザー',
-    createdAt: Date.now(),
-    avatar: null,
-    avatarUpdatedAt: 0,
-    title: null,
-    suspendedUntil: null,
-    banned: false,
-    bannedUntil: null,
-    premium: false,
-    superPremium: false
-  };
-}
-
-function isPlaceholderUserName(name) {
-  const n = String(name || '').trim();
-  return !n || ['友だち', '友達', '友達さん', 'ユーザー', '不明'].includes(n);
-}
-
-function pickBetterUserName(localName, incomingName) {
-  const local = String(localName || '').trim();
-  const incoming = String(incomingName || '').trim();
-  if (!incoming) return local || 'ユーザー';
-  if (!local) return incoming;
-  const localPh = isPlaceholderUserName(local);
-  const incomingPh = isPlaceholderUserName(incoming);
-  if (localPh && !incomingPh) return incoming;
-  if (!localPh && incomingPh) return local;
-  return incoming.length >= local.length ? incoming : local;
-}
-
-function mergeUserProfile(data, profile) {
-  if (!profile || !profile.id) return;
-  if (!data.users) data.users = {};
-  const uid = String(profile.id);
-  const existing = data.users[uid] || stubUserRecord(uid, profile.name);
-  const name = pickBetterUserName(existing.name, profile.name);
-  data.users[uid] = {
-    ...existing,
-    ...profile,
-    id: uid,
-    name,
-    avatar: profile.avatar !== undefined ? profile.avatar : existing.avatar,
-    avatarUpdatedAt: profile.avatarUpdatedAt || existing.avatarUpdatedAt || 0
-  };
-}
-
-function inferUserName(data, uid) {
-  for (const post of data.posts || []) {
-    if (String(post.authorId) === uid && post.authorName) return String(post.authorName);
-  }
-  for (const fr of data.friendRequests || []) {
-    if (String(fr.fromId) === uid && fr.fromName) return String(fr.fromName);
-    if (String(fr.toId) === uid && fr.toName) return String(fr.toName);
-  }
-  const presence = data.presence && data.presence[uid];
-  if (presence && presence.userName) return String(presence.userName);
-  return 'ユーザー';
-}
-
-function ensureUserRecord(data, uid) {
-  if (!data.users) data.users = {};
-  if (data.users[uid]) return data.users[uid];
-  data.users[uid] = stubUserRecord(uid, inferUserName(data, uid));
-  return data.users[uid];
-}
-
-function rebuildUserConversationIndex(data) {
-  if (!data.userConversations) data.userConversations = {};
-  Object.values(data.conversations || {}).forEach(conv => {
-    const convId = conv && conv.id;
-    if (!convId) return;
-    (conv.members || []).forEach(memberId => {
-      const mid = String(memberId);
-      if (!mid) return;
-      if (!data.userConversations[mid]) data.userConversations[mid] = {};
-      data.userConversations[mid][convId] = true;
-    });
-  });
-}
-
-function repairMissingUsers(data) {
-  rebuildUserConversationIndex(data);
-  const ids = new Set();
-  Object.keys(data.userConversations || {}).forEach(uid => ids.add(uid));
-  Object.values(data.conversations || {}).forEach(conv => {
-    (conv.members || []).forEach(mid => ids.add(String(mid)));
-  });
-  let repaired = 0;
-  ids.forEach(uid => {
-    if (!uid) return;
-    if (!data.users || !data.users[uid]) {
-      ensureUserRecord(data, uid);
-      repaired += 1;
-    }
-  });
-  return repaired;
-}
-
-function buildUserSyncBundle(data, userId) {
-  const uid = String(userId);
-  rebuildUserConversationIndex(data);
-  const convIds = Object.keys((data.userConversations && data.userConversations[uid]) || {});
-  if (convIds.length === 0) return null;
-  const user = ensureUserRecord(data, uid);
-  const conversations = {};
-  const messages = {};
-  const users = { [uid]: user };
-  const readReceipts = {};
-
-  convIds.forEach(convId => {
-    const conv = data.conversations && data.conversations[convId];
-    if (!conv) return;
-    conversations[convId] = conv;
-    (conv.members || []).forEach(mid => {
-      ensureUserRecord(data, String(mid));
-      if (data.users[mid]) users[String(mid)] = data.users[mid];
-    });
-    const convMsgs = (data.messages && data.messages[convId]) || {};
-    messages[convId] = Array.isArray(convMsgs)
-      ? convMsgs
-      : Object.values(convMsgs).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-    if (data.readReceipts && data.readReceipts[convId]) {
-      readReceipts[convId] = data.readReceipts[convId];
-    }
-  });
-
-  return {
-    version: 2,
-    exportedAt: Date.now(),
-    syncUrl: null,
-    data: {
-      currentUserId: uid,
-      users,
-      friendCodes: {},
-      friendships: friendshipListForUser(data, uid),
-      conversations,
-      messages,
-      readReceipts,
-      customStickerPacks: (data.userStickers && data.userStickers[uid] && data.userStickers[uid].packs) || [],
-      titlePresets: data.titlePresets || []
-    }
-  };
-}
-
-function assignDevicePairShortCode(data, token, expiresAt) {
-  if (!data.shortDevicePairs) data.shortDevicePairs = {};
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  for (let attempt = 0; attempt < 40; attempt++) {
-    let code = '';
-    for (let i = 0; i < 12; i++) {
-      code += chars[Math.floor(Math.random() * chars.length)];
-    }
-    const prev = data.shortDevicePairs[code];
-    if (!prev || Date.now() > (prev.expiresAt || 0)) {
-      data.shortDevicePairs[code] = { token: String(token), expiresAt: expiresAt || Date.now() + 15 * 60 * 1000 };
-      return code;
-    }
-  }
-  return crypto.randomBytes(8).toString('hex').toUpperCase();
-}
-
-function getDevicePairShortRef(data, shortCode) {
-  if (!data.shortDevicePairs) return null;
-  const ref = data.shortDevicePairs[String(shortCode || '').trim()];
-  if (!ref || Date.now() > (ref.expiresAt || 0)) return null;
-  return ref;
-}
-
-function createTransferEntry(data, backup, hours) {
-  if (!data.transfers) data.transfers = {};
-  if (!data.shortTransfers) data.shortTransfers = {};
-  const token = Date.now().toString(36) + crypto.randomBytes(8).toString('hex');
-  const expiresAt = Date.now() + (hours || 24) * 60 * 60 * 1000;
-  data.transfers[token] = {
-    backup,
-    expiresAt,
-    consumed: false,
-    createdAt: Date.now()
-  };
-  let shortCode = '';
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  for (let i = 0; i < 12; i++) {
-    shortCode += chars[Math.floor(Math.random() * chars.length)];
-  }
-  data.shortTransfers[shortCode] = { token, expiresAt };
-  return { token, shortCode, code: 'bluechat-transfer:' + token, expiresAt };
-}
-
-function emptyData() {
-  return {
-    conversations: {},
-    messages: {},
-    userConversations: {},
-    users: {},
-    friendships: {},
-    userFriendships: {},
-    readReceipts: {},
-    transfers: {},
-    shortTransfers: {},
-    devicePairs: {},
-    shortDevicePairs: {},
-    adminSessions: {},
-    callSignals: {},
-    feedback: [],
-    cloudBackups: {},
-    presence: {},
-    announcements: [],
-    announcementReads: {},
-    posts: [],
-    friendRequests: [],
-    sharedStickerPacks: {},
-    activityVersion: 0,
-    titlePresets: []
-  };
-}
-
-function createFriendshipOnServer(data, id1, id2, createdAt) {
-  const a = String(id1);
-  const b = String(id2);
-  if (!a || !b || a === b) return false;
-  if (!data.friendships) data.friendships = {};
-  if (!data.userFriendships) data.userFriendships = {};
-  if (!data.conversations) data.conversations = {};
-  if (!data.userConversations) data.userConversations = {};
-  const key = 'f_' + [a, b].sort().join('_');
-  if (!data.friendships[key]) {
-    data.friendships[key] = { user1: a, user2: b, createdAt: createdAt || Date.now() };
-  }
-  [a, b].forEach(uid => {
-    if (!data.userFriendships[uid]) data.userFriendships[uid] = {};
-    data.userFriendships[uid][uid === a ? b : a] = true;
-  });
-  const convId = 'dm_' + [a, b].sort().join('_');
-  if (!data.conversations[convId]) {
-    data.conversations[convId] = {
-      id: convId,
-      type: 'direct',
-      members: [a, b].sort(),
-      createdAt: createdAt || Date.now(),
-      lastMessageAt: null,
-      lastMessagePreview: null
-    };
-  }
-  [a, b].forEach(uid => {
-    if (!data.userConversations[uid]) data.userConversations[uid] = {};
-    data.userConversations[uid][convId] = true;
-  });
-  return true;
-}
-
-function normalizeData(data) {
-  const base = emptyData();
-  if (!data || typeof data !== 'object') return { ...base };
-  for (const key of Object.keys(base)) {
-    if (data[key] === undefined) data[key] = base[key];
-  }
-  return data;
-}
-
-// Upstash REST の pipeline エンドポイントに1コマンド投げるヘルパー
-async function upstashCommand(command) {
-  const res = await fetch(getUpstashUrl() + '/', {
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + getUpstashToken(),
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(command)
-  });
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch (e) {
-    throw new Error('Upstash HTTP ' + res.status + ' invalid JSON');
-  }
-  if (!res.ok) {
-    throw new Error('Upstash HTTP ' + res.status + (json && json.error ? ': ' + json.error : ''));
-  }
-  if (json && json.error) throw new Error('Upstash error: ' + json.error);
-  return json ? json.result : null;
-}
-
-function mediaChunkKey(uploadId, partIndex) {
-  return MEDIA_CHUNK_PREFIX + uploadId + ':' + partIndex;
-}
-
-function mediaBlobKey(uploadId) {
-  return MEDIA_BLOB_PREFIX + uploadId;
-}
-
-const MEDIA_STRIP_FIELDS = ['image', 'video', 'fileData', 'stickerImage'];
-
-function stripMessageForLite(msg) {
-  if (!msg || typeof msg !== 'object') return msg;
-  const out = { ...msg };
-  for (const field of MEDIA_STRIP_FIELDS) {
-    const payload = out[field];
-    if (typeof payload === 'string' && payload.length > 50000) {
-      if (!out.blobRef || out.blobRef.field !== field) out._needsFull = true;
-      delete out[field];
-    } else if (out.blobRef && out.blobRef.field === field) {
-      delete out[field];
-    }
-  }
-  if (out.blobRef && out.blobRef.field === 'text' && typeof out.text === 'string' && out.text.length > 120) {
-    out.text = out.text.slice(0, 80) + '…';
-  }
-  if (typeof out.text === 'string' && out.text.length > 100000) {
-    out.text = out.text.slice(0, 120) + '…';
-    out._needsFull = true;
-  }
-  return out;
-}
-
-async function handleMediaChunkRoutes(req, res, parts) {
-  const isMediaRoute = parts[0] === 'api' && parts[1] === 'media';
-  if (!isMediaRoute) return false;
-  if (!isUpstashEnabled()) {
-    sendJson(res, 501, { error: 'chunk upload requires upstash' });
-    return true;
-  }
-
-  if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'chunk' && parts[3] && parts[4] !== undefined && parts[4] !== 'complete') {
-    const uploadId = parts[3];
-    const partIndex = parseInt(parts[4], 10);
-    if (!uploadId || Number.isNaN(partIndex) || partIndex < 0) {
-      sendJson(res, 400, { error: 'invalid chunk path' });
-      return true;
-    }
-    const body = await readBody(req);
-    if (!body || typeof body.data !== 'string') {
-      sendJson(res, 400, { error: 'invalid chunk body' });
-      return true;
-    }
-    if (body.data.length > MAX_MEDIA_CHUNK_BYTES) {
-      sendJson(res, 413, { error: 'chunk too large' });
-      return true;
-    }
-    await upstashCommand(['SET', mediaChunkKey(uploadId, partIndex), body.data]);
-    sendJson(res, 200, { ok: true, partIndex, totalParts: body.totalParts || 0 });
-    return true;
-  }
-
-  if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'chunk' && parts[3] && parts[4] === 'complete') {
-    const uploadId = parts[3];
-    const body = await readBody(req);
-    const totalParts = parseInt(body.totalParts || 0, 10);
-    if (!uploadId || !totalParts || totalParts > 500) {
-      sendJson(res, 400, { error: 'invalid totalParts' });
-      return true;
-    }
-    const chunks = [];
-    for (let i = 0; i < totalParts; i++) {
-      const part = await upstashCommand(['GET', mediaChunkKey(uploadId, i)]);
-      if (typeof part !== 'string') {
-        sendJson(res, 400, { error: 'missing part ' + i });
-        return true;
-      }
-      chunks.push(part);
-    }
-    const data = chunks.join('');
-    const blobPayload = JSON.stringify({
-      data,
-      mimeType: body.mimeType || 'application/octet-stream',
-      field: body.field || 'image',
-      size: data.length,
-      createdAt: Date.now()
-    });
-    await upstashCommand(['SET', mediaBlobKey(uploadId), blobPayload]);
-    for (let i = 0; i < totalParts; i++) {
-      upstashCommand(['DEL', mediaChunkKey(uploadId, i)]).catch(() => {});
-    }
-    sendJson(res, 200, { ok: true, uploadId, size: data.length });
-    return true;
-  }
-
-  if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'blob' && parts[3]) {
-    const raw = await upstashCommand(['GET', mediaBlobKey(parts[3])]);
-    if (!raw) {
-      sendJson(res, 404, { error: 'not found' });
-      return true;
-    }
-    try {
-      sendJson(res, 200, JSON.parse(raw));
-    } catch (e) {
-      sendJson(res, 500, { error: 'invalid blob' });
-    }
-    return true;
-  }
-
-  return false;
-}
-
-async function loadDataFromStorage() {
-  if (isUpstashEnabled()) {
-    // 読み込み失敗時に emptyData() へフォールバックすると、後続の saveData が
-    // 正常データを空で上書きしてしまう。必ず throw して 500 にし、データを守る。
-    const raw = await upstashCommand(['GET', UPSTASH_KEY]);
-    return normalizeData(raw ? JSON.parse(raw) : emptyData());
-  }
-  try {
-    return normalizeData(JSON.parse(fs.readFileSync(getDataFile(), 'utf8')));
-  } catch (e) {
-    return emptyData();
-  }
-}
-
-let memData = null;
-let memVer = null; // isolate 内キャッシュが対応する UPSTASH_VER_KEY の値
-let dataLock = Promise.resolve();
-
-function withDataLock(fn) {
-  const run = dataLock.then(fn);
-  dataLock = run.catch(() => {});
-  return run;
-}
-
-async function loadData() {
-  return withDataLock(async () => {
-    if (memData && !isWorkerRuntime()) {
-      return JSON.parse(JSON.stringify(memData));
-    }
-    if (memData && isWorkerRuntime() && isUpstashEnabled()) {
-      // キャッシュあり: 軽量バージョンキーだけ確認し、不変ならフル取得をスキップ
-      try {
-        const ver = await upstashCommand(['GET', UPSTASH_VER_KEY]);
-        if (ver !== null && memVer !== null && String(ver) === String(memVer)) {
-          return JSON.parse(JSON.stringify(memData));
-        }
-      } catch (e) {
-        // バージョン確認に失敗しても古いキャッシュで処理を継続する
-        // (書き込みは saveData 側の失敗で止まるため空データ化の危険はない)
-        console.error('Upstash version check failed, serving cached data:', e.message);
-        return JSON.parse(JSON.stringify(memData));
-      }
-    }
-    memData = await loadDataFromStorage();
-    if (isWorkerRuntime() && isUpstashEnabled()) {
-      try {
-        let ver = await upstashCommand(['GET', UPSTASH_VER_KEY]);
-        if (ver === null) {
-          // 初回: マーカーを設置して以降のキャッシュを有効化
-          ver = 'init-' + Date.now() + '-' + crypto.randomBytes(6).toString('hex');
-          await upstashCommand(['SET', UPSTASH_VER_KEY, ver]);
-        }
-        memVer = String(ver);
-      } catch (e) {
-        memVer = null;
-      }
-    }
-    return JSON.parse(JSON.stringify(memData));
-  });
-}
-
-async function saveDataToStorage(data) {
-  const normalized = normalizeData(data);
-  if (isUpstashEnabled()) {
-    await upstashCommand(['SET', UPSTASH_KEY, JSON.stringify(normalized)]);
-    // データ書込成功後にバージョンを進める
-    const ver = Date.now() + '-' + crypto.randomBytes(6).toString('hex');
-    await upstashCommand(['SET', UPSTASH_VER_KEY, ver]);
-    memVer = ver;
-    return;
-  }
-  fs.writeFileSync(getDataFile(), JSON.stringify(normalized));
-}
-
-async function saveData(data) {
-  return withDataLock(async () => {
-    memData = normalizeData(JSON.parse(JSON.stringify(data)));
-    await saveDataToStorage(memData);
-  });
-}
-
-async function saveDataWithActivity(data) {
-  data.activityVersion = (data.activityVersion || 0) + 1;
-  await saveData(data);
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    if (req._body !== undefined) {
-      if (String(req._body || '').length > MAX_BODY_BYTES) {
-        reject(new Error('body too large'));
-        return;
-      }
-      try {
-        resolve(req._body ? JSON.parse(req._body) : {});
-      } catch (e) {
-        reject(e);
-      }
-      return;
-    }
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk;
-      if (body.length > MAX_BODY_BYTES) {
-        reject(new Error('body too large'));
-        req.destroy();
-      }
-    });
-    req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
-function sendJson(res, status, data) {
-  const cors = res._corsHeaders || {
-    'Access-Control-Allow-Origin': 'https://bluechat.by-youhei.workers.dev',
+    'Access-Control-Allow-Origin': allowed,
     'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token, X-User-Id'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token, X-User-Id',
+    'Access-Control-Max-Age': '86400',
   };
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    ...cors
-  });
-  res.end(JSON.stringify(data));
 }
 
-const server = IS_WORKER_BUNDLE ? null : http.createServer(processSyncRequest);
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+  });
+}
 
-async function processSyncRequest(req, res) {
-  res._corsHeaders = corsHeaders(req);
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, res._corsHeaders);
-    res.end();
-    return;
+function respond(data, status, origin) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...corsHeaders(origin),
+    },
+  });
+}
+
+// ─── KV helpers ─────────────────────────────────────────────────────────────
+async function kvGet(env, key) {
+  try {
+    const val = await env.BLUECHAT_KV.get(key);
+    if (val === null) return null;
+    return JSON.parse(val);
+  } catch { return null; }
+}
+
+async function kvPut(env, key, value) {
+  await env.BLUECHAT_KV.put(key, JSON.stringify(value));
+}
+
+async function kvDelete(env, key) {
+  await env.BLUECHAT_KV.delete(key);
+}
+
+// ─── Auth helpers ────────────────────────────────────────────────────────────
+function generateToken(length = 32) {
+  const chars = 'abcdef0123456789';
+  let s = '';
+  for (let i = 0; i < length * 2; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+async function getAdminCreds(env) {
+  return {
+    email: (env.ADMIN_EMAIL || '').trim(),
+    password: (env.ADMIN_PASSWORD || '').trim(),
+  };
+}
+
+async function verifyToken(env, token) {
+  if (!token) return null;
+  const sessions = (await kvGet(env, 'auth:sessions')) || {};
+  return sessions[token] || null; // returns { userId, role, ts }
+}
+
+async function verifyRequest(env, request) {
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!token) return null;
+  return verifyToken(env, token);
+}
+
+// ─── Main handler ────────────────────────────────────────────────────────────
+export async function handleRequest(request, env, ctx) {
+  const url = new URL(request.url);
+  const origin = request.headers.get('Origin') || ALLOWED_ORIGINS[0];
+  const cors = corsHeaders(origin);
+
+  // OPTIONS preflight
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: cors });
   }
 
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const parts = url.pathname.split('/').filter(Boolean);
+  const parts = url.pathname.replace(/^\//, '').split('/');
+  // parts[0] = 'api', parts[1] = endpoint, ...
+
+  if (parts[0] !== 'api') {
+    return new Response('Not found', { status: 404 });
+  }
 
   try {
-    if (req.method === 'GET' && parts.length === 0) {
-      sendJson(res, 200, {
-        ok: true,
-        service: 'BlueChat Sync',
-        health: '/api/health',
-        usage: 'マイページの同期サーバーURLにこのサイトのURLを入力してください'
-      });
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'health') {
-      let writable = true;
-      let upstashError = null;
-      let dataBytes = null;
-      if (isUpstashEnabled()) {
-        try {
-          await upstashCommand(['SET', 'bluechat:health-probe', String(Date.now())]);
-        } catch (e) {
-          writable = false;
-          upstashError = String(e.message || e);
-        }
-        try {
-          dataBytes = await upstashCommand(['STRLEN', UPSTASH_KEY]);
-        } catch (e) { /* 診断用なので失敗しても無視 */ }
-      } else if (!isWorkerRuntime()) {
-        try {
-          const probe = path.join(path.dirname(getDataFile()), '.bluechat-health-probe');
-          fs.writeFileSync(probe, String(Date.now()));
-          fs.unlinkSync(probe);
-        } catch (e) {
-          writable = false;
-        }
-      } else {
-        writable = false;
-      }
-      sendJson(res, 200, {
-        ok: writable,
-        service: 'BlueChat Sync',
-        version: SERVER_VERSION,
-        writable,
-        storage: isUpstashEnabled() ? 'upstash' : (isWorkerRuntime() ? 'worker-required-upstash' : 'file'),
-        ...(dataBytes !== null ? { dataBytes } : {}),
-        ...(upstashError ? { upstashError } : {})
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'login') {
-      const body = await readBody(req);
-      const role = verifyAdminLogin(body.email, body.password);
-      if (!role) {
-        sendJson(res, 401, { error: 'invalid' });
-        return;
-      }
-      const data = await loadData();
-      const token = issueAdminSession(data, role);
-      await saveData(data);
-      sendJson(res, 200, { ok: true, role, token });
-      return;
-    }
-
-    const data = await loadData();
-    const auth = resolveRequestAuth(req, data, verifyAdminSession);
-
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'auth' && parts[2] === 'claim-token') {
-      const body = await readBody(req);
-      const userId = String(body.userId || '').trim();
-      if (!userId || !data.users || !data.users[userId]) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      const user = data.users[userId];
-      const proof = String(body.passwordHash || '');
-      const password = body.password === undefined ? null : String(body.password || '');
-      const proofOk = user.passwordHash
-        ? (proof && user.passwordHash === proof) || (password !== null && verifyUserPasswordProof(password, user.passwordHash))
-        : true;
-      if (!proofOk) {
-        sendJson(res, 403, { error: 'invalid_proof' });
-        return;
-      }
-      if (!user.apiToken) user.apiToken = generateApiToken();
-      await saveData(data);
-      sendJson(res, 200, { ok: true, apiToken: user.apiToken });
-      return;
-    }
-
-    const access = checkApiAccess(req, res, data, parts, url, auth, res._corsHeaders);
-    if (access === 'handled') return;
-
-    if (await handleMediaChunkRoutes(req, res, parts)) return;
-
-    const adminToken = req.headers['x-admin-token'] || req.headers['X-Admin-Token'] || '';
-    const adminRoleFromToken = auth.kind === 'admin' ? auth.role : null;
-
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'force-sync') {
-      let role = adminRoleFromToken;
-      const body = await readBody(req);
-      if (!role) role = verifyAdminLogin(body.email, body.password);
-      if (!role) {
-        sendJson(res, 401, { error: 'unauthorized' });
-        return;
-      }
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, version: data.activityVersion || 0 });
-      return;
-    }
-
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'repair-users') {
-      let role = adminRoleFromToken;
-      const body = await readBody(req);
-      if (!role) role = verifyAdminLogin(body.email, body.password);
-      if (role !== 'super') {
-        sendJson(res, 401, { error: 'unauthorized' });
-        return;
-      }
-      const repaired = repairMissingUsers(data);
-      if (repaired > 0) await saveDataWithActivity(data);
-      else await saveData(data);
-      sendJson(res, 200, {
-        ok: true,
-        repaired,
-        users: Object.keys(data.users || {}).length
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'issue-transfer') {
-      if (verifyAdminSession(data, adminToken, true) !== 'super') {
-        sendJson(res, 401, { error: 'unauthorized' });
-        return;
-      }
-      const body = await readBody(req);
-      const userId = String(body.userId || '').trim();
-      if (!userId) {
-        sendJson(res, 400, { error: 'userId required' });
-        return;
-      }
-      let backup = (data.cloudBackups && data.cloudBackups[userId] && data.cloudBackups[userId].backup) || null;
-      if (!backup || !backup.data) {
-        backup = buildUserSyncBundle(data, userId);
-      }
-      if (!backup || !backup.data) {
-        sendJson(res, 404, { error: 'no_data' });
-        return;
-      }
-      const entry = createTransferEntry(data, backup, body.hours || 72);
-      await saveData(data);
-      sendJson(res, 200, {
-        ok: true,
-        code: entry.code,
-        shortCode: entry.shortCode,
-        expiresAt: entry.expiresAt
-      });
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'user' && parts[2] && parts[3] === 'sync-bundle') {
-      const userId = parts[2];
-      const bundle = buildUserSyncBundle(data, userId);
-      if (!bundle) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      sendJson(res, 200, bundle);
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'transfer-short' && parts[2]) {
-      const short = String(parts[2] || '').trim().toUpperCase();
-      const ref = (data.shortTransfers && data.shortTransfers[short]) || null;
-      if (!ref || Date.now() > ref.expiresAt) {
-        sendJson(res, 404, { error: 'expired' });
-        return;
-      }
-      const t = data.transfers && data.transfers[ref.token];
-      if (!t || Date.now() > t.expiresAt) {
-        sendJson(res, 404, { error: 'expired' });
-        return;
-      }
-      sendJson(res, 200, { code: 'bluechat-transfer:' + ref.token });
-      return;
-    }
-
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'conversations' && parts[2]) {
-      const conv = await readBody(req);
-      const convId = parts[2];
-      const isNewConv = !data.conversations[convId];
-      data.conversations[convId] = { ...conv, id: convId };
-      if (!data.userConversations) data.userConversations = {};
-      (conv.members || []).forEach(memberId => {
-        const mid = String(memberId);
-        if (!data.userConversations[mid]) data.userConversations[mid] = {};
-        data.userConversations[mid][convId] = true;
-      });
-      if (isNewConv) await saveDataWithActivity(data);
-      else await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'messages' && parts[2] && parts[3]) {
-      const convId = parts[2];
-      const msgId = parts[3];
-      if (data.messages[convId]) delete data.messages[convId][msgId];
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'messages' && parts[2] && parts[3] === 'ids') {
-      const convId = parts[2];
-      const convMsgs = data.messages[convId] || {};
-      sendJson(res, 200, Object.keys(convMsgs));
-      return;
-    }
-
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'messages' && parts[2] && parts[3]) {
-      const convId = parts[2];
-      const msgId = parts[3];
-      const msg = await readBody(req);
-      if (auth.kind === 'user' && String(msg.senderId || '') !== String(auth.userId)) {
-        sendJson(res, 403, { error: 'sender_mismatch' });
-        return;
-      }
-      if (!data.messages) data.messages = {};
-      if (!data.messages[convId]) data.messages[convId] = {};
-      const isNew = !data.messages[convId][msgId];
-      data.messages[convId][msgId] = { ...msg, id: msgId };
-      if (isNew) await saveDataWithActivity(data);
-      else await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'messages' && parts[2] && parts[3] && parts[3] !== 'ids') {
-      const convId = parts[2];
-      const msgId = parts[3];
-      const msg = (data.messages[convId] || {})[msgId] || null;
-      if (!msg) sendJson(res, 404, { error: 'not found' });
-      else sendJson(res, 200, msg);
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'messages' && parts[2]) {
-      const convId = parts[2];
-      const since = parseInt(url.searchParams.get('since') || '0', 10);
-      const lite = url.searchParams.get('lite') === '1';
-      const convMsgs = data.messages[convId] || {};
-      let list = Object.values(convMsgs)
-        .filter(m => (m.timestamp || 0) > since)
-        .sort((a, b) => a.timestamp - b.timestamp);
-      if (lite) list = list.map(stripMessageForLite);
-      sendJson(res, 200, list);
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'conversations' && parts[2] === 'list') {
-      const list = Object.values(data.conversations || {})
-        .sort((a, b) => (b.lastMessageAt || b.createdAt || 0) - (a.lastMessageAt || a.createdAt || 0));
-      sendJson(res, 200, list);
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'conversations' && parts[2]) {
-      const conv = data.conversations[parts[2]] || null;
-      sendJson(res, 200, conv);
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'user' && parts[2] && parts[3] === 'conversations') {
-      const userId = String(parts[2]);
-      const userConvs = (data.userConversations && data.userConversations[userId]) || {};
-      sendJson(res, 200, Object.keys(userConvs));
-      return;
-    }
-
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'users' && parts[2]) {
-      const user = await readBody(req);
-      if (!data.users) data.users = {};
-      const uid = String(parts[2]);
-      const prev = data.users[uid] || {};
-      const isNew = !prev.id;
-      const isAdmin = auth.kind === 'admin';
-      let apiToken = prev.apiToken || null;
-      if (!apiToken) apiToken = generateApiToken();
-      const next = {
-        ...prev,
-        ...user,
-        id: uid,
-        apiToken
-      };
-      if (!isAdmin) {
-        next.banned = prev.banned;
-        next.bannedUntil = prev.bannedUntil;
-        next.suspendedUntil = prev.suspendedUntil;
-        next.premium = prev.premium;
-        next.superPremium = prev.superPremium;
-        next.title = prev.title;
-      }
-      delete next.apiToken;
-      next.apiToken = apiToken;
-      data.users[uid] = next;
-      const moderationChanged = isAdmin && (
-        prev.banned !== next.banned
-        || prev.bannedUntil !== next.bannedUntil
-        || prev.suspendedUntil !== next.suspendedUntil
-        || prev.premium !== next.premium
-        || prev.superPremium !== next.superPremium
-        || JSON.stringify(prev.title) !== JSON.stringify(next.title)
-      );
-      const profileChanged = prev.avatar !== next.avatar
-        || (prev.avatarUpdatedAt || 0) !== (next.avatarUpdatedAt || 0)
-        || prev.name !== next.name
-        || prev.passwordHash !== next.passwordHash;
-      if (moderationChanged || profileChanged || isNew) await saveDataWithActivity(data);
-      else await saveData(data);
-      sendJson(res, 200, { ok: true, apiToken: isNew || !prev.apiToken ? apiToken : undefined });
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'users' && parts[2] === 'list') {
-      const users = Object.values(data.users || {}).map(u => ({
-        id: u.id,
-        name: u.name,
-        createdAt: u.createdAt,
-        avatar: u.avatar || null,
-        avatarUpdatedAt: u.avatarUpdatedAt || 0,
-        title: u.title || null,
-        suspendedUntil: u.suspendedUntil || null,
-        banned: u.banned || false,
-        bannedUntil: u.bannedUntil || null,
-        premium: u.premium || false,
-        superPremium: u.superPremium || false
-      }));
-      users.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      sendJson(res, 200, users);
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'users' && parts[2]) {
-      const user = sanitizeUser((data.users && data.users[parts[2]]) || null);
-      sendJson(res, 200, user);
-      return;
-    }
-
-    if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'users' && parts[2]) {
-      const userId = String(parts[2]);
-      if (data.users) delete data.users[userId];
-      if (data.userFriendships && data.userFriendships[userId]) delete data.userFriendships[userId];
-      if (data.cloudBackups && data.cloudBackups[userId]) delete data.cloudBackups[userId];
-      if (data.userStickers && data.userStickers[userId]) delete data.userStickers[userId];
-      if (data.presence && data.presence[userId]) delete data.presence[userId];
-      if (data.announcementReads && data.announcementReads[userId]) delete data.announcementReads[userId];
-      Object.keys(data.friendships || {}).forEach(key => {
-        const f = data.friendships[key];
-        if (f && (String(f.user1) === userId || String(f.user2) === userId)) delete data.friendships[key];
-      });
-      if (data.userConversations && data.userConversations[userId]) delete data.userConversations[userId];
-      Object.keys(data.userConversations || {}).forEach(uid => {
-        if (data.userConversations[uid] && data.userConversations[uid][userId]) {
-          delete data.userConversations[uid][userId];
-        }
-      });
-      Object.keys(data.conversations || {}).forEach(convId => {
-        const conv = data.conversations[convId];
-        if (!conv || !conv.members) return;
-        if (conv.members.map(String).includes(userId)) {
-          conv.members = conv.members.filter(m => String(m) !== userId);
-          if (conv.members.length === 0) {
-            delete data.conversations[convId];
-            if (data.messages && data.messages[convId]) delete data.messages[convId];
-            if (data.userConversations) {
-              Object.keys(data.userConversations).forEach(uid => {
-                if (data.userConversations[uid][convId]) delete data.userConversations[uid][convId];
-              });
-            }
-          }
-        }
-      });
-      Object.keys(data.callSignals || {}).forEach(uid => {
-        if (String(uid) === userId) delete data.callSignals[uid];
-      });
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'friendships' && parts[2]) {
-      const body = await readBody(req);
-      if (auth.kind === 'user' && !isFriendshipParticipant(body, auth.userId)) {
-        sendJson(res, 403, { error: 'not_participant' });
-        return;
-      }
-      const id1 = String(body.user1 || '');
-      const id2 = String(body.user2 || '');
-      if (!id1 || !id2 || id1 === id2) {
-        sendJson(res, 400, { error: 'invalid' });
-        return;
-      }
-      if (!data.friendships) data.friendships = {};
-      if (!data.userFriendships) data.userFriendships = {};
-      if (!data.conversations) data.conversations = {};
-      if (!data.userConversations) data.userConversations = {};
-      data.friendships[parts[2]] = { user1: id1, user2: id2, createdAt: body.createdAt || Date.now() };
-      if (body.users && typeof body.users === 'object') {
-        Object.values(body.users).forEach(u => mergeUserProfile(data, u));
-      } else {
-        [id1, id2].forEach(uid => ensureUserRecord(data, uid));
-      }
-      [id1, id2].forEach(uid => {
-        if (!data.userFriendships[uid]) data.userFriendships[uid] = {};
-        data.userFriendships[uid][uid === id1 ? id2 : id1] = true;
-      });
-      const convId = 'dm_' + [id1, id2].sort().join('_');
-      if (!data.conversations[convId]) {
-        data.conversations[convId] = {
-          id: convId,
-          type: 'direct',
-          members: [id1, id2].sort(),
-          createdAt: body.createdAt || Date.now(),
-          lastMessageAt: null,
-          lastMessagePreview: null
-        };
-      }
-      [id1, id2].forEach(uid => {
-        if (!data.userConversations[uid]) data.userConversations[uid] = {};
-        data.userConversations[uid][convId] = true;
-      });
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'user' && parts[2] && parts[3] === 'friendships') {
-      const userId = String(parts[2]);
-      const friends = (data.userFriendships && data.userFriendships[userId]) || {};
-      sendJson(res, 200, Object.keys(friends));
-      return;
-    }
-
-    // Read receipts
-    if (!data.readReceipts) data.readReceipts = {};
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'reads' && parts[2] && parts[3]) {
-      const body = await readBody(req);
-      if (!data.readReceipts[parts[2]]) data.readReceipts[parts[2]] = {};
-      data.readReceipts[parts[2]][parts[3]] = body.timestamp || Date.now();
-      await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'reads' && parts[2]) {
-      sendJson(res, 200, data.readReceipts[parts[2]] || {});
-      return;
-    }
-
-    // Device pair (QR multi-device sync)
-    if (!data.devicePairs) data.devicePairs = {};
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'device-pair' && parts[2]) {
-      const body = await readBody(req);
-      if (!body.userId) {
-        sendJson(res, 400, { error: 'user_required' });
-        return;
-      }
-      data.devicePairs[parts[2]] = {
-        userId: String(body.userId),
-        userName: body.userName || 'ユーザー',
-        passwordHash: body.passwordHash || null,
-        syncUrl: body.syncUrl || null,
-        expiresAt: body.expiresAt || Date.now() + 15 * 60 * 1000,
-        consumed: false,
-        consumedAt: null,
-        createdAt: Date.now()
-      };
-      const shortCode = assignDevicePairShortCode(data, parts[2], data.devicePairs[parts[2]].expiresAt);
-      data.devicePairs[parts[2]].shortCode = shortCode;
-      await saveData(data);
-      sendJson(res, 200, { ok: true, shortCode, token: parts[2] });
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'device-pair-short' && parts[2] === 'register') {
-      const body = await readBody(req);
-      const token = String(body.token || '').trim();
-      if (!token || !data.devicePairs[token]) {
-        sendJson(res, 404, { error: 'pair_not_found' });
-        return;
-      }
-      const shortCode = assignDevicePairShortCode(data, token, body.expiresAt || data.devicePairs[token].expiresAt);
-      data.devicePairs[token].shortCode = shortCode;
-      await saveData(data);
-      sendJson(res, 200, { ok: true, shortCode });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'device-pair-short' && parts[2]) {
-      const ref = getDevicePairShortRef(data, parts[2]);
-      if (!ref) {
-        sendJson(res, 404, { error: 'expired' });
-        return;
-      }
-      const entry = data.devicePairs[ref.token];
-      if (!entry || Date.now() > entry.expiresAt) {
-        sendJson(res, 404, { error: 'expired' });
-        return;
-      }
-      sendJson(res, 200, {
-        token: ref.token,
-        userId: entry.userId,
-        userName: entry.userName,
-        requiresPassword: !!entry.passwordHash,
-        syncUrl: entry.syncUrl || null,
-        shortCode: parts[2]
-      });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'device-pair' && parts[2] && parts[3] === 'status') {
-      const entry = data.devicePairs[parts[2]];
-      if (!entry || Date.now() > entry.expiresAt) {
-        sendJson(res, 200, { consumed: false, exists: false });
-        return;
-      }
-      sendJson(res, 200, {
-        consumed: !!entry.consumed,
-        exists: true,
-        consumedAt: entry.consumedAt || null
-      });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'device-pair' && parts[2]) {
-      const entry = data.devicePairs[parts[2]];
-      if (!entry || Date.now() > entry.expiresAt) {
-        sendJson(res, 404, { error: 'expired' });
-        return;
-      }
-      sendJson(res, 200, {
-        userId: entry.userId,
-        userName: entry.userName,
-        requiresPassword: !!entry.passwordHash,
-        syncUrl: entry.syncUrl || null
-      });
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'device-pair' && parts[2] && parts[3] === 'consumed') {
-      const entry = data.devicePairs[parts[2]];
-      if (entry) {
-        entry.consumed = true;
-        entry.consumedAt = Date.now();
-        await saveDataWithActivity(data);
-      }
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // Device transfer
-    if (!data.transfers) data.transfers = {};
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'transfer' && parts[2]) {
-      const body = await readBody(req);
-      data.transfers[parts[2]] = {
-        backup: body.backup,
-        expiresAt: body.expiresAt || Date.now() + 86400000,
-        consumed: false,
-        createdAt: Date.now()
-      };
-      await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'transfer' && parts[2] && parts[3] === 'status') {
-      const t = data.transfers[parts[2]];
-      sendJson(res, 200, { consumed: !!(t && t.consumed), exists: !!t });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'transfer' && parts[2]) {
-      const t = data.transfers[parts[2]];
-      if (!t || Date.now() > t.expiresAt) {
-        sendJson(res, 404, { error: 'expired' });
-        return;
-      }
-      sendJson(res, 200, { backup: t.backup });
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'transfer' && parts[2] && parts[3] === 'consumed') {
-      if (data.transfers[parts[2]]) {
-        data.transfers[parts[2]].consumed = true;
-        await saveData(data);
-      }
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // WebRTC signaling
-    if (!data.callSignals) data.callSignals = {};
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'call' && parts[2] === 'signal') {
-      const body = await readBody(req);
-      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-      if (!data.callSignals[body.to]) data.callSignals[body.to] = [];
-      data.callSignals[body.to].push({ id, ...body });
-      if (data.callSignals[body.to].length > 100) {
-        data.callSignals[body.to] = data.callSignals[body.to].slice(-50);
-      }
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'call' && parts[2] === 'signals' && parts[3]) {
-      const userId = String(parts[3]);
-      const since = parseInt(url.searchParams.get('since') || '0', 10);
-      const all = data.callSignals[userId] || [];
-      const list = all.filter(s => (s.timestamp || 0) > since);
-      if (list.length) {
-        const delivered = new Set(list.map(s => s.id));
-        data.callSignals[userId] = all.filter(s => !delivered.has(s.id));
-        await saveData(data);
-      }
-      sendJson(res, 200, list);
-      return;
-    }
-
-    // Cloud backup (7-day retention, restore anytime)
-    if (!data.cloudBackups) data.cloudBackups = {};
-    // Title presets (max 10, shared across all clients)
-    if (!data.titlePresets) data.titlePresets = [];
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'title-presets') {
-      sendJson(res, 200, { presets: data.titlePresets || [] });
-      return;
-    }
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'title-presets') {
-      const body = await readBody(req);
-      const presets = Array.isArray(body.presets) ? body.presets.slice(0, 10) : [];
-      data.titlePresets = presets.map(p => ({
-        id: p.id || Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
-        text: String(p.text || '').trim().slice(0, 20),
-        color: String(p.color || '#1a6fd4').trim()
-      })).filter(p => p.text);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, presets: data.titlePresets });
-      return;
-    }
-
-    // User sticker packs (sync across browsers on same account)
-    if (!data.userStickers) data.userStickers = {};
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'user-stickers' && parts[2]) {
-      const body = await readBody(req);
-      data.userStickers[parts[2]] = {
-        packs: body.packs || [],
-        updatedAt: body.updatedAt || Date.now()
-      };
-      await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'user-stickers' && parts[2]) {
-      const entry = data.userStickers[parts[2]] || { packs: [], updatedAt: 0 };
-      sendJson(res, 200, entry);
-      return;
-    }
-
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'cloud-backup' && parts[2]) {
-      const body = await readBody(req);
-      const userId = parts[2];
-      data.cloudBackups[userId] = {
-        backup: body.backup,
-        updatedAt: body.updatedAt || Date.now(),
-        expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000
-      };
-      await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'cloud-backup' && parts[2]) {
-      const entry = data.cloudBackups[parts[2]];
-      if (!entry || Date.now() > entry.expiresAt) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      sendJson(res, 200, { backup: entry.backup, updatedAt: entry.updatedAt });
-      return;
-    }
-
-    // Presence (online/offline)
-    if (!data.presence) data.presence = {};
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'presence' && parts[2]) {
-      const body = await readBody(req);
-      data.presence[parts[2]] = { lastSeen: body.lastSeen || Date.now() };
-      await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'presence') {
-      const ids = (url.searchParams.get('ids') || '').split(',').filter(Boolean);
-      const result = {};
-      ids.forEach(id => {
-        if (data.presence[id]) result[id] = data.presence[id];
-      });
-      sendJson(res, 200, result);
-      return;
-    }
-
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'line-stickers' && parts[2]) {
-      const productId = parts[2];
-      const https = require('https');
-      const fetchJson = (fetchUrl) => new Promise((resolve, reject) => {
-        https.get(fetchUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            Accept: 'application/json'
-          }
-        }, (resp) => {
-          let d = '';
-          resp.on('data', c => { d += c; });
-          resp.on('end', () => {
-            if (resp.statusCode && resp.statusCode >= 400) {
-              reject(new Error('HTTP ' + resp.statusCode));
-              return;
-            }
-            try { resolve(JSON.parse(d)); } catch (e) { reject(e); }
-          });
-        }).on('error', reject);
-      });
-      const metaUrls = [
-        `https://stickershop.line-scdn.net/stickershop/v1/product/${productId}/iphone/productInfo.meta`,
-        `https://stickershop.line-scdn.net/stickershop/v1/product/${productId}/android/productInfo.meta`
-      ];
-      try {
-        let meta = null;
-        for (const metaUrl of metaUrls) {
-          try {
-            meta = await fetchJson(metaUrl);
-            if (meta && Array.isArray(meta.stickers) && meta.stickers.length) break;
-          } catch (e) { /* try next */ }
-        }
-        if (!meta || !Array.isArray(meta.stickers) || !meta.stickers.length) {
-          sendJson(res, 404, {
-            error: 'スタンプ情報を取得できませんでした。商品IDまたはURLを確認してください',
-            stickers: []
-          });
-          return;
-        }
-        const titleObj = meta.title || {};
-        const name = titleObj.ja || titleObj.en || titleObj['zh-Hant'] || ('LINE ' + productId);
-        const isAnimated = !!(
-          meta.hasAnimation
-          || meta.stickerResourceType === 'ANIMATION'
-          || meta.stickerResourceType === 'SOUND'
-        );
-        const stickers = meta.stickers.slice(0, 40).map(s => ({
-          id: String(s.id),
-          url: isAnimated
-            ? `https://stickershop.line-scdn.net/stickershop/v1/sticker/${s.id}/IOS/sticker_animation.png`
-            : `https://stickershop.line-scdn.net/stickershop/v1/sticker/${s.id}/android/sticker.png`,
-          emoji: isAnimated ? '🎬' : '🎨',
-          isAnimated
-        }));
-        sendJson(res, 200, { name, stickers, productId, isAnimated });
-      } catch (e) {
-        sendJson(res, 500, { error: e.message || '取得エラー', stickers: [] });
-      }
-      return;
-    }
-
-    // Activity version (meaningful actions only: messages, calls, announcements, etc.)
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'sync-version') {
-      sendJson(res, 200, { version: data.activityVersion || 0 });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'activity-version') {
-      sendJson(res, 200, { version: data.activityVersion || 0 });
-      return;
-    }
-
-    // Announcements (お知らせ)
-    if (!data.announcements) data.announcements = [];
-    if (!data.announcementReads) data.announcementReads = {};
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'announcements') {
-      const userId = url.searchParams.get('userId') || '';
-      const groupIds = (url.searchParams.get('groupIds') || '').split(',').filter(Boolean);
-      let list = [...data.announcements];
-      if (userId) {
-        const uid = String(userId);
-        const groupSet = new Set(groupIds.map(String));
-        list = list.filter(a => {
-          if (a.type === 'global') return true;
-          if (a.type === 'personal') {
-            return (a.targetUserIds || []).some(id => String(id) === uid);
-          }
-          if (a.type === 'group') return groupSet.has(String(a.groupId));
-          return false;
-        });
-      }
-      list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      sendJson(res, 200, list);
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'announcements') {
-      const body = await readBody(req);
-      const entry = {
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        title: body.title || '',
-        body: body.body || '',
-        type: body.type || 'global',
-        targetUserIds: body.targetUserIds || [],
-        groupId: body.groupId || null,
-        authorId: body.authorId,
-        authorName: body.authorName || '管理者',
-        authorAvatar: body.authorAvatar || null,
-        media: body.media || null,
-        attachment: body.attachment || null,
-        createdAt: Date.now(),
-        comments: []
-      };
-      data.announcements.unshift(entry);
-      if (data.announcements.length > 200) data.announcements = data.announcements.slice(0, 200);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, id: entry.id });
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'announcements' && parts[2] && parts[3] === 'comments') {
-      const body = await readBody(req);
-      const ann = data.announcements.find(a => a.id === parts[2]);
-      if (!ann) { sendJson(res, 404, { error: 'not_found' }); return; }
-      if (!ann.comments) ann.comments = [];
-      ann.comments.push({
-        id: Date.now().toString(36),
-        userId: body.userId,
-        userName: body.userName || 'ユーザー',
-        text: body.text || '',
-        createdAt: Date.now()
-      });
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'announcements' && parts[2] && parts[3] === 'comments' && parts[4]) {
-      const ann = data.announcements.find(a => a.id === parts[2]);
-      if (!ann) { sendJson(res, 404, { error: 'not_found' }); return; }
-      const body = await readBody(req);
-      const comment = (ann.comments || []).find(c => c.id === parts[4]);
-      if (!comment || comment.userId !== body.userId) {
-        sendJson(res, 403, { error: 'forbidden' });
-        return;
-      }
-      ann.comments = ann.comments.filter(c => c.id !== parts[4]);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'announcements' && parts[2]) {
-      data.announcements = data.announcements.filter(a => a.id !== parts[2]);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'announcement-reads' && parts[2] && parts[3]) {
-      const userId = parts[2];
-      const annId = parts[3];
-      if (!data.announcementReads[userId]) data.announcementReads[userId] = {};
-      data.announcementReads[userId][annId] = Date.now();
-      await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'announcement-reads' && parts[2]) {
-      sendJson(res, 200, data.announcementReads[parts[2]] || {});
-      return;
-    }
-
-    // Public feed posts (photo / video / notice)
-    if (!data.posts) data.posts = [];
-    const normalizePostEntry = (p) => {
-      if (!p) return p;
-      if (!p.likes || typeof p.likes !== 'object') p.likes = {};
-      if (!p.dislikes || typeof p.dislikes !== 'object') p.dislikes = {};
-      if (!Array.isArray(p.comments)) p.comments = [];
-      return p;
-    };
-    const stripPostForList = (p) => {
-      const o = normalizePostEntry({ ...p });
-      if (o.authorAvatar && String(o.authorAvatar).length > 256) o.authorAvatar = null;
-      if (o.media && o.media.data) {
-        o.media = {
-          type: o.media.type || 'image',
-          mimeType: o.media.mimeType || '',
-          fileName: o.media.fileName || '',
-          _hasRemoteData: true
-        };
-      }
-      if (o.attachment && o.attachment.data) {
-        o.attachment = {
-          fileName: o.attachment.fileName || 'file',
-          mimeType: o.attachment.mimeType || '',
-          size: o.attachment.size || 0,
-          _hasRemoteData: true
-        };
-      }
-      return o;
-    };
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'posts' && parts.length === 2) {
-      const lite = url.searchParams.get('lite') === '1';
-      const list = data.posts
-        .map(p => lite ? stripPostForList(p) : normalizePostEntry(p))
-        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      sendJson(res, 200, list.slice(0, 300));
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'posts' && parts[2] && !parts[3]) {
-      const post = data.posts.find(p => p.id === parts[2]);
-      if (!post) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      sendJson(res, 200, normalizePostEntry(post));
-      return;
-    }
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'posts' && parts[2] && parts[3] === 'vote') {
-      const body = await readBody(req);
-      const userId = String(body.userId || '');
-      const vote = body.vote;
-      if (!userId) {
-        sendJson(res, 400, { error: 'user_required' });
-        return;
-      }
-      const post = data.posts.find(p => p.id === parts[2]);
-      if (!post) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      normalizePostEntry(post);
-      delete post.likes[userId];
-      delete post.dislikes[userId];
-      if (vote === 'up') post.likes[userId] = Date.now();
-      else if (vote === 'down') post.dislikes[userId] = Date.now();
-      await saveDataWithActivity(data);
-      sendJson(res, 200, {
-        ok: true,
-        likes: Object.keys(post.likes).length,
-        dislikes: Object.keys(post.dislikes).length
-      });
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'posts' && parts[2] && parts[3] === 'comments') {
-      const body = await readBody(req);
-      const post = data.posts.find(p => p.id === parts[2]);
-      if (!post) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      normalizePostEntry(post);
-      post.comments.push({
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 4),
-        userId: String(body.userId || ''),
-        userName: body.userName || 'ユーザー',
-        userAvatar: body.userAvatar || null,
-        text: String(body.text || '').slice(0, 2000),
-        createdAt: Date.now()
-      });
-      if (post.comments.length > 500) post.comments = post.comments.slice(-500);
-      const added = post.comments[post.comments.length - 1];
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, comment: added });
-      return;
-    }
-    if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'posts' && parts[2] && parts[3] === 'comments' && parts[4]) {
-      const body = await readBody(req);
-      const post = data.posts.find(p => p.id === parts[2]);
-      if (!post) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      const comment = (post.comments || []).find(c => c.id === parts[4]);
-      if (!comment || String(comment.userId) !== String(body.userId || '')) {
-        sendJson(res, 403, { error: 'forbidden' });
-        return;
-      }
-      post.comments = post.comments.filter(c => c.id !== parts[4]);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'posts' && parts.length === 2) {
-      const body = await readBody(req);
-      if (!body.authorId) {
-        sendJson(res, 400, { error: 'author_required' });
-        return;
-      }
-      const entry = normalizePostEntry({
-        id: body.id || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
-        kind: body.kind || 'photo',
-        text: body.text || '',
-        authorId: String(body.authorId),
-        authorName: body.authorName || 'ユーザー',
-        authorAvatar: body.authorAvatar || null,
-        media: body.media || null,
-        attachment: body.attachment || null,
-        createdAt: body.createdAt || Date.now(),
-        likes: {},
-        dislikes: {},
-        comments: []
-      });
-      const exists = data.posts.find(p => p.id === entry.id);
-      if (!exists) data.posts.unshift(entry);
-      else Object.assign(exists, entry);
-      if (data.posts.length > 300) data.posts = data.posts.slice(0, 300);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, id: entry.id });
-      return;
-    }
-    if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'posts' && parts[2] && !parts[3]) {
-      const body = await readBody(req);
-      const post = data.posts.find(p => p.id === parts[2]);
-      if (!post) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      if (String(post.authorId) !== String(body.userId || '')) {
-        sendJson(res, 403, { error: 'forbidden' });
-        return;
-      }
-      data.posts = data.posts.filter(p => p.id !== parts[2]);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // Friend requests (apply → accept → friendship without QR)
-    if (!data.friendRequests) data.friendRequests = [];
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'friend-requests') {
-      const userId = String(url.searchParams.get('userId') || '');
-      if (!userId) {
-        sendJson(res, 400, { error: 'user_required' });
-        return;
-      }
-      const list = (data.friendRequests || []).filter(r =>
-        r.status === 'pending' && (String(r.fromId) === userId || String(r.toId) === userId)
-      );
-      list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      sendJson(res, 200, list);
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'friend-requests') {
-      const body = await readBody(req);
-      const fromId = String(body.fromId || '');
-      const toId = String(body.toId || '');
-      if (!fromId || !toId || fromId === toId) {
-        sendJson(res, 400, { error: 'invalid' });
-        return;
-      }
-      const uf = (data.userFriendships && data.userFriendships[fromId]) || {};
-      if (uf[toId]) {
-        sendJson(res, 409, { error: 'already_friends' });
-        return;
-      }
-      const existing = (data.friendRequests || []).find(r =>
-        r.status === 'pending' &&
-        ((String(r.fromId) === fromId && String(r.toId) === toId) ||
-         (String(r.fromId) === toId && String(r.toId) === fromId))
-      );
-      if (existing) {
-        sendJson(res, 200, { ok: true, id: existing.id, existing: true });
-        return;
-      }
-      const entry = {
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        fromId,
-        fromName: body.fromName || 'ユーザー',
-        fromAvatar: body.fromAvatar || null,
-        toId,
-        message: body.message || '',
-        status: 'pending',
-        createdAt: Date.now()
-      };
-      data.friendRequests.unshift(entry);
-      if (data.friendRequests.length > 500) data.friendRequests = data.friendRequests.slice(0, 500);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, id: entry.id });
-      return;
-    }
-    if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'friend-requests' && parts[2]) {
-      const body = await readBody(req);
-      const reqId = parts[2];
-      const userId = String(body.userId || '');
-      const action = body.action || '';
-      const fr = (data.friendRequests || []).find(r => r.id === reqId);
-      if (!fr) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      if (String(fr.toId) !== userId) {
-        sendJson(res, 403, { error: 'forbidden' });
-        return;
-      }
-      if (fr.status !== 'pending') {
-        sendJson(res, 409, { error: 'already_handled' });
-        return;
-      }
-      if (action === 'decline') {
-        fr.status = 'declined';
-        fr.handledAt = Date.now();
-        await saveDataWithActivity(data);
-        sendJson(res, 200, { ok: true, status: 'declined' });
-        return;
-      }
-      if (action === 'accept') {
-        fr.status = 'accepted';
-        fr.handledAt = Date.now();
-        createFriendshipOnServer(data, fr.fromId, fr.toId, Date.now());
-        await saveDataWithActivity(data);
-        sendJson(res, 200, { ok: true, status: 'accepted' });
-        return;
-      }
-      sendJson(res, 400, { error: 'invalid_action' });
-      return;
-    }
-
-    // Shared sticker packs (free share via bc-sticker:CODE)
-    if (!data.sharedStickerPacks) data.sharedStickerPacks = {};
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'shared-sticker-packs') {
-      const body = await readBody(req);
-      const shareId = String(body.shareId || '').trim() ||
-        (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)).slice(0, 10);
-      if (!body.stickers || !body.stickers.length) {
-        sendJson(res, 400, { error: 'stickers_required' });
-        return;
-      }
-      const entry = {
-        shareId,
-        packName: body.packName || '共有スタンプ',
-        authorId: body.authorId || null,
-        authorName: body.authorName || 'ユーザー',
-        stickers: body.stickers.slice(0, 40),
-        createdAt: Date.now()
-      };
-      data.sharedStickerPacks[shareId] = entry;
-      const keys = Object.keys(data.sharedStickerPacks);
-      if (keys.length > 200) {
-        keys.sort((a, b) =>
-          (data.sharedStickerPacks[a].createdAt || 0) - (data.sharedStickerPacks[b].createdAt || 0)
-        );
-        keys.slice(0, keys.length - 200).forEach(k => delete data.sharedStickerPacks[k]);
-      }
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, shareId, code: 'bc-sticker:' + shareId });
-      return;
-    }
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'shared-sticker-packs' && parts[2]) {
-      const pack = data.sharedStickerPacks[parts[2]] || null;
-      if (!pack) {
-        sendJson(res, 404, { error: 'not_found' });
-        return;
-      }
-      sendJson(res, 200, pack);
-      return;
-    }
-
-    if (!data.feedback) data.feedback = [];
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'feedback') {
-      const type = url.searchParams.get('type');
-      let list = [...(data.feedback || [])];
-      if (type) list = list.filter(f => f.type === type);
-      list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      sendJson(res, 200, list);
-      return;
-    }
-    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'feedback') {
-      const body = await readBody(req);
-      const entry = {
-        ...body,
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        receivedAt: Date.now()
-      };
-      data.feedback.push(entry);
-      if (data.feedback.length > 500) data.feedback = data.feedback.slice(-200);
-      await saveDataWithActivity(data);
-      sendJson(res, 200, { ok: true, id: entry.id });
-      return;
-    }
-    if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'feedback' && parts[2]) {
-      data.feedback = (data.feedback || []).filter(f => f.id !== parts[2]);
-      await saveData(data);
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    sendJson(res, 404, { error: 'Not found' });
-  } catch (e) {
-    sendJson(res, 500, { error: e.message });
+    return await route(request, env, parts, url, origin, cors);
+  } catch (err) {
+    console.error('Server error:', err);
+    return respond({ ok: false, error: 'Internal server error' }, 500, origin);
   }
 }
 
-if (!IS_WORKER_BUNDLE && require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`BlueChat sync server: http://0.0.0.0:${PORT}`);
-    if (isUpstashEnabled()) {
-      console.log('Storage: Upstash Redis (persistent across restarts) —', getUpstashUrl());
-    } else {
-      console.log('Storage: local file:', getDataFile());
-    }
-    console.log('Health check: GET /api/health');
-  });
-}
+async function route(request, env, parts, url, origin, cors) {
+  const p1 = parts[1];
+  const p2 = parts[2];
+  const p3 = parts[3];
+  const p4 = parts[4];
+  const method = request.method;
 
-module.exports = { processSyncRequest, configureRuntime };
+  // ── Health ──────────────────────────────────────────────────────────────
+  if (p1 === 'health' && method === 'GET') {
+    let writable = false;
+    let storage = 'none';
+    try {
+      await kvPut(env, '_health_probe', Date.now());
+      writable = true;
+      storage = 'kv';
+    } catch {}
+    return respond({ ok: true, version: VERSION, storage, writable }, 200, origin);
+  }
+
+  // ── Auth: claim token ────────────────────────────────────────────────────
+  if (p1 === 'auth' && p2 === 'claim-token' && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const userId = String(body.userId || '').trim();
+    if (!userId) return respond({ ok: false, error: 'userId required' }, 400, origin);
+
+    const sessions = (await kvGet(env, 'auth:sessions')) || {};
+    const token = generateToken(24);
+    sessions[token] = { userId, role: 'user', ts: Date.now() };
+    await kvPut(env, 'auth:sessions', sessions);
+
+    return respond({ ok: true, token }, 200, origin);
+  }
+
+  // ── Admin login ──────────────────────────────────────────────────────────
+  if (p1 === 'admin' && p2 === 'login' && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const creds = await getAdminCreds(env);
+    if (!creds.email || !creds.password) {
+      return respond({ ok: false, error: 'Admin credentials not configured' }, 500, origin);
+    }
+    const inputEmail = String(body.email || '').trim().toLowerCase();
+    const inputPass = String(body.password || '').trim();
+    if (inputEmail !== creds.email.toLowerCase() || inputPass !== creds.password) {
+      return respond({ ok: false, error: 'Invalid credentials' }, 401, origin);
+    }
+    const sessions = (await kvGet(env, 'auth:sessions')) || {};
+    const token = generateToken(24);
+    sessions[token] = { userId: 'admin', role: 'super', ts: Date.now() };
+    await kvPut(env, 'auth:sessions', sessions);
+    return respond({ ok: true, role: 'super', token }, 200, origin);
+  }
+
+  // ── Admin: users list ────────────────────────────────────────────────────
+  if (p1 === 'admin' && p2 === 'users' && method === 'GET') {
+    const auth = await verifyRequest(env, request);
+    if (!auth || auth.role !== 'super') return respond({ ok: false, error: 'forbidden' }, 403, origin);
+    const users = (await kvGet(env, 'users')) || {};
+    return respond({ ok: true, users }, 200, origin);
+  }
+
+  // ── Admin: conversations list ─────────────────────────────────────────────
+  if (p1 === 'admin' && p2 === 'conversations' && method === 'GET') {
+    const auth = await verifyRequest(env, request);
+    if (!auth || auth.role !== 'super') return respond({ ok: false, error: 'forbidden' }, 403, origin);
+    const conversations = (await kvGet(env, 'conversations')) || {};
+    return respond({ ok: true, conversations }, 200, origin);
+  }
+
+  // ── Admin: delete user ───────────────────────────────────────────────────
+  if (p1 === 'admin' && p2 === 'delete-user' && p3 && method === 'DELETE') {
+    const auth = await verifyRequest(env, request);
+    if (!auth || auth.role !== 'super') return respond({ ok: false, error: 'forbidden' }, 403, origin);
+    const users = (await kvGet(env, 'users')) || {};
+    delete users[p3];
+    await kvPut(env, 'users', users);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Users: get list ──────────────────────────────────────────────────────
+  if (p1 === 'users' && p2 === 'list' && method === 'GET') {
+    const users = (await kvGet(env, 'users')) || {};
+    return respond({ ok: true, users }, 200, origin);
+  }
+
+  // ── Users: get single ────────────────────────────────────────────────────
+  if (p1 === 'users' && p2 && !p3 && method === 'GET') {
+    const users = (await kvGet(env, 'users')) || {};
+    const user = users[p2];
+    if (!user) return respond({ ok: false, error: 'not found' }, 404, origin);
+    return respond({ ok: true, user }, 200, origin);
+  }
+
+  // ── Users: upsert ────────────────────────────────────────────────────────
+  if (p1 === 'users' && p2 && !p3 && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const users = (await kvGet(env, 'users')) || {};
+    users[p2] = { ...users[p2], ...body, id: p2, updatedAt: Date.now() };
+    await kvPut(env, 'users', users);
+    return respond({ ok: true, user: users[p2] }, 200, origin);
+  }
+
+  // ── Users: delete ────────────────────────────────────────────────────────
+  if (p1 === 'users' && p2 && method === 'DELETE') {
+    const auth = await verifyRequest(env, request);
+    if (!auth || (auth.role !== 'super' && auth.userId !== p2)) {
+      return respond({ ok: false, error: 'forbidden' }, 403, origin);
+    }
+    const users = (await kvGet(env, 'users')) || {};
+    delete users[p2];
+    await kvPut(env, 'users', users);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Messages: get by conv ────────────────────────────────────────────────
+  if (p1 === 'messages' && p2 && !p3 && method === 'GET') {
+    const since = parseInt(url.searchParams.get('since') || '0');
+    const messages = (await kvGet(env, `messages:${p2}`)) || {};
+    const result = since > 0
+      ? Object.fromEntries(Object.entries(messages).filter(([, v]) => v.timestamp > since))
+      : messages;
+    return respond({ ok: true, messages: result }, 200, origin);
+  }
+
+  // ── Messages: get IDs ────────────────────────────────────────────────────
+  if (p1 === 'messages' && p2 && p3 === 'ids' && method === 'GET') {
+    const messages = (await kvGet(env, `messages:${p2}`)) || {};
+    return respond({ ok: true, ids: Object.keys(messages) }, 200, origin);
+  }
+
+  // ── Messages: upsert ────────────────────────────────────────────────────
+  if (p1 === 'messages' && p2 && p3 && p3 !== 'ids' && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const messages = (await kvGet(env, `messages:${p2}`)) || {};
+    messages[p3] = { ...body, id: p3, convId: p2 };
+    await kvPut(env, `messages:${p2}`, messages);
+    // bump sync version
+    await kvPut(env, 'sync-version', Date.now());
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Messages: delete ────────────────────────────────────────────────────
+  if (p1 === 'messages' && p2 && p3 && method === 'DELETE') {
+    const messages = (await kvGet(env, `messages:${p2}`)) || {};
+    delete messages[p3];
+    await kvPut(env, `messages:${p2}`, messages);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Conversations: list ──────────────────────────────────────────────────
+  if (p1 === 'conversations' && p2 === 'list' && method === 'GET') {
+    const conversations = (await kvGet(env, 'conversations')) || {};
+    return respond({ ok: true, conversations }, 200, origin);
+  }
+
+  // ── Conversations: get single ────────────────────────────────────────────
+  if (p1 === 'conversations' && p2 && p2 !== 'list' && !p3 && method === 'GET') {
+    const conversations = (await kvGet(env, 'conversations')) || {};
+    const conv = conversations[p2];
+    if (!conv) return respond({ ok: false, error: 'not found' }, 404, origin);
+    return respond({ ok: true, conversation: conv }, 200, origin);
+  }
+
+  // ── Conversations: upsert ────────────────────────────────────────────────
+  if (p1 === 'conversations' && p2 && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const conversations = (await kvGet(env, 'conversations')) || {};
+    conversations[p2] = { ...conversations[p2], ...body, id: p2 };
+    await kvPut(env, 'conversations', conversations);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── User conversations ───────────────────────────────────────────────────
+  if (p1 === 'user' && p2 && p3 === 'conversations' && method === 'GET') {
+    const conversations = (await kvGet(env, 'conversations')) || {};
+    const userConvs = Object.fromEntries(
+      Object.entries(conversations).filter(([, v]) =>
+        Array.isArray(v.participants) && v.participants.includes(p2)
+      )
+    );
+    return respond({ ok: true, conversations: userConvs }, 200, origin);
+  }
+
+  // ── Friendships ──────────────────────────────────────────────────────────
+  if (p1 === 'friendships' && p2 && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const friendships = (await kvGet(env, 'friendships')) || {};
+    const key = [p2, body.friendId].sort().join(':');
+    friendships[key] = { users: [p2, body.friendId], ts: Date.now(), ...body };
+    await kvPut(env, 'friendships', friendships);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  if (p1 === 'user' && p2 && p3 === 'friendships' && method === 'GET') {
+    const friendships = (await kvGet(env, 'friendships')) || {};
+    const userFriendships = Object.fromEntries(
+      Object.entries(friendships).filter(([k]) => k.includes(p2))
+    );
+    return respond({ ok: true, friendships: userFriendships }, 200, origin);
+  }
+
+  // ── Read receipts ────────────────────────────────────────────────────────
+  if (p1 === 'reads' && p2 && p3 && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const reads = (await kvGet(env, `reads:${p2}`)) || {};
+    reads[p3] = { userId: p3, convId: p2, lastRead: body.lastRead || Date.now() };
+    await kvPut(env, `reads:${p2}`, reads);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  if (p1 === 'reads' && p2 && !p3 && method === 'GET') {
+    const reads = (await kvGet(env, `reads:${p2}`)) || {};
+    return respond({ ok: true, reads }, 200, origin);
+  }
+
+  // ── Presence ────────────────────────────────────────────────────────────
+  if (p1 === 'presence' && method === 'GET') {
+    const presence = (await kvGet(env, 'presence')) || {};
+    return respond({ ok: true, presence }, 200, origin);
+  }
+
+  if (p1 === 'presence' && p2 && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const presence = (await kvGet(env, 'presence')) || {};
+    presence[p2] = { userId: p2, ts: Date.now(), status: body.status || 'online' };
+    await kvPut(env, 'presence', presence);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Call signals ─────────────────────────────────────────────────────────
+  if (p1 === 'call' && p2 === 'signal' && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const { to, from, type, data: sigData } = body;
+    if (!to || !from) return respond({ ok: false, error: 'to/from required' }, 400, origin);
+    const signals = (await kvGet(env, `call:signals:${to}`)) || [];
+    signals.push({ from, type, data: sigData, ts: Date.now() });
+    // keep last 50 signals only
+    if (signals.length > 50) signals.splice(0, signals.length - 50);
+    await kvPut(env, `call:signals:${to}`, signals);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  if (p1 === 'call' && p2 === 'signals' && p3 && method === 'GET') {
+    const since = parseInt(url.searchParams.get('since') || '0');
+    const signals = (await kvGet(env, `call:signals:${p3}`)) || [];
+    const result = since > 0 ? signals.filter(s => s.ts > since) : signals;
+    // clear after read
+    if (result.length > 0 && !url.searchParams.get('peek')) {
+      const remaining = signals.filter(s => !result.includes(s));
+      await kvPut(env, `call:signals:${p3}`, remaining);
+    }
+    return respond({ ok: true, signals: result }, 200, origin);
+  }
+
+  // ── Posts (BlueMoment) ───────────────────────────────────────────────────
+  if (p1 === 'posts' && !p2 && method === 'GET') {
+    const posts = (await kvGet(env, 'posts')) || [];
+    return respond({ ok: true, posts }, 200, origin);
+  }
+
+  if (p1 === 'posts' && !p2 && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const posts = (await kvGet(env, 'posts')) || [];
+    const id = `post_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const post = {
+      id,
+      userId: body.userId,
+      text: body.text || '',
+      image: body.image || null,
+      timestamp: Date.now(),
+      likes: [],
+      dislikes: [],
+      comments: [],
+    };
+    posts.unshift(post);
+    await kvPut(env, 'posts', posts);
+    return respond({ ok: true, post }, 200, origin);
+  }
+
+  if (p1 === 'posts' && p2 && p3 === 'vote' && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const posts = (await kvGet(env, 'posts')) || [];
+    const idx = posts.findIndex(p => p.id === p2);
+    if (idx === -1) return respond({ ok: false, error: 'not found' }, 404, origin);
+    const post = posts[idx];
+    const { userId, vote } = body; // vote: 'like' | 'dislike' | null
+    post.likes = (post.likes || []).filter(id => id !== userId);
+    post.dislikes = (post.dislikes || []).filter(id => id !== userId);
+    if (vote === 'like') post.likes.push(userId);
+    if (vote === 'dislike') post.dislikes.push(userId);
+    posts[idx] = post;
+    await kvPut(env, 'posts', posts);
+    return respond({ ok: true, post }, 200, origin);
+  }
+
+  if (p1 === 'posts' && p2 && p3 === 'comments' && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const posts = (await kvGet(env, 'posts')) || [];
+    const idx = posts.findIndex(p => p.id === p2);
+    if (idx === -1) return respond({ ok: false, error: 'not found' }, 404, origin);
+    const cid = `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const comment = { id: cid, userId: body.userId, text: body.text, ts: Date.now() };
+    posts[idx].comments = posts[idx].comments || [];
+    posts[idx].comments.push(comment);
+    await kvPut(env, 'posts', posts);
+    return respond({ ok: true, comment }, 200, origin);
+  }
+
+  if (p1 === 'posts' && p2 && p3 === 'comments' && p4 && method === 'DELETE') {
+    const posts = (await kvGet(env, 'posts')) || [];
+    const idx = posts.findIndex(p => p.id === p2);
+    if (idx !== -1) {
+      posts[idx].comments = (posts[idx].comments || []).filter(c => c.id !== p4);
+      await kvPut(env, 'posts', posts);
+    }
+    return respond({ ok: true }, 200, origin);
+  }
+
+  if (p1 === 'posts' && p2 && !p3 && method === 'DELETE') {
+    const posts = (await kvGet(env, 'posts')) || [];
+    const filtered = posts.filter(p => p.id !== p2);
+    await kvPut(env, 'posts', filtered);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Announcements ────────────────────────────────────────────────────────
+  if (p1 === 'announcements' && !p2 && method === 'GET') {
+    const announcements = (await kvGet(env, 'announcements')) || [];
+    return respond({ ok: true, announcements }, 200, origin);
+  }
+
+  if (p1 === 'announcements' && !p2 && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const auth = await verifyRequest(env, request);
+    if (!auth || auth.role !== 'super') return respond({ ok: false, error: 'forbidden' }, 403, origin);
+    const announcements = (await kvGet(env, 'announcements')) || [];
+    const id = `ann_${Date.now()}`;
+    announcements.unshift({ id, ...body, ts: Date.now() });
+    await kvPut(env, 'announcements', announcements);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  if (p1 === 'announcements' && p2 && method === 'DELETE') {
+    const auth = await verifyRequest(env, request);
+    if (!auth || auth.role !== 'super') return respond({ ok: false, error: 'forbidden' }, 403, origin);
+    const announcements = (await kvGet(env, 'announcements')) || [];
+    await kvPut(env, 'announcements', announcements.filter(a => a.id !== p2));
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Title presets ────────────────────────────────────────────────────────
+  if (p1 === 'title-presets' && method === 'GET') {
+    const presets = (await kvGet(env, 'title-presets')) || [];
+    return respond({ ok: true, presets }, 200, origin);
+  }
+
+  if (p1 === 'title-presets' && method === 'PUT') {
+    const auth = await verifyRequest(env, request);
+    if (!auth || auth.role !== 'super') return respond({ ok: false, error: 'forbidden' }, 403, origin);
+    const body = await request.json().catch(() => ({}));
+    await kvPut(env, 'title-presets', body.presets || []);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── Sync version ─────────────────────────────────────────────────────────
+  if (p1 === 'sync-version' && method === 'GET') {
+    const v = (await kvGet(env, 'sync-version')) || 0;
+    return respond({ ok: true, version: v }, 200, origin);
+  }
+
+  // ── Media: chunk upload ──────────────────────────────────────────────────
+  if (p1 === 'media' && p2 === 'chunk' && p3 && p4 !== undefined && p4 !== 'complete' && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    const chunks = (await kvGet(env, `media:chunks:${p3}`)) || {};
+    chunks[p4] = body.data;
+    await kvPut(env, `media:chunks:${p3}`, chunks);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  if (p1 === 'media' && p2 === 'chunk' && p3 && p4 === 'complete' && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const chunks = (await kvGet(env, `media:chunks:${p3}`)) || {};
+    const total = parseInt(body.totalChunks || 1);
+    let combined = '';
+    for (let i = 0; i < total; i++) {
+      combined += (chunks[String(i)] || '');
+    }
+    await kvPut(env, `media:blob:${p3}`, { data: combined, type: body.mimeType || 'image/jpeg' });
+    await kvDelete(env, `media:chunks:${p3}`);
+    return respond({ ok: true, uploadId: p3 }, 200, origin);
+  }
+
+  if (p1 === 'media' && p2 === 'blob' && p3 && method === 'GET') {
+    const blob = await kvGet(env, `media:blob:${p3}`);
+    if (!blob) return respond({ ok: false, error: 'not found' }, 404, origin);
+    return respond({ ok: true, data: blob.data, mimeType: blob.type }, 200, origin);
+  }
+
+  // ── User stickers ────────────────────────────────────────────────────────
+  if (p1 === 'user-stickers' && p2 && method === 'GET') {
+    const stickers = (await kvGet(env, `stickers:${p2}`)) || [];
+    return respond({ ok: true, stickers }, 200, origin);
+  }
+
+  if (p1 === 'user-stickers' && p2 && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    await kvPut(env, `stickers:${p2}`, body.stickers || []);
+    return respond({ ok: true }, 200, origin);
+  }
+
+  // ── User sync bundle (for device transfer) ───────────────────────────────
+  if (p1 === 'user' && p2 && p3 === 'sync-bundle' && method === 'GET') {
+    const users = (await kvGet(env, 'users')) || {};
+    const friendships = (await kvGet(env, 'friendships')) || {};
+    const user = users[p2];
+    if (!user) return respond({ ok: false, error: 'not found' }, 404, origin);
+    const userFriendships = Object.fromEntries(
+      Object.entries(friendships).filter(([k]) => k.includes(p2))
+    );
+    return respond({ ok: true, user, friendships: userFriendships }, 200, origin);
+  }
+
+  // ── Cloud backup ─────────────────────────────────────────────────────────
+  if (p1 === 'cloud-backup' && p2 && method === 'PUT') {
+    const body = await request.json().catch(() => ({}));
+    await kvPut(env, `backup:${p2}`, { data: body, ts: Date.now() });
+    return respond({ ok: true }, 200, origin);
+  }
+
+  if (p1 === 'cloud-backup' && p2 && method === 'GET') {
+    const backup = await kvGet(env, `backup:${p2}`);
+    if (!backup) return respond({ ok: false, error: 'not found' }, 404, origin);
+    return respond({ ok: true, backup: backup.data, ts: backup.ts }, 200, origin);
+  }
+
+  // ── Activity version ─────────────────────────────────────────────────────
+  if (p1 === 'activity-version' && method === 'GET') {
+    const v = (await kvGet(env, 'activity-version')) || 0;
+    return respond({ ok: true, version: v }, 200, origin);
+  }
+
+  return respond({ ok: false, error: 'Not found' }, 404, origin);
+}
